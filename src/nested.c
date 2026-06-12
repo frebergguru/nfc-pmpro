@@ -2,9 +2,9 @@
  *
  * Collection: device cmd 14 (foothold sector with a known key -> target sector),
  * returning 15 foothold nonce pairs + 8 target {nt, NtEnc, parity} records.
- * Recovery: the open-source crapto1/mfoc algorithm (vendored in src/hardnested),
- * NOT the obfuscated native .fr. Candidates are confirmed on the card via cmd 13,
- * so a recovered key is always real.
+ * Recovery: the open-source crapto1 algorithm in src/crypto1.c (cr1_*), NOT the
+ * obfuscated native .fr. Candidates are confirmed on the card via cmd 13, so a
+ * recovered key is always real.
  *
  * Decrypted cmd 14 payload layout (empirically validated against the fob):
  *   [0..12]   header: uid(4) + 04 00 + keytype(60/61) + 00 01 + 00 00 00 00
@@ -99,8 +99,11 @@ static int nested_batch(pmpro_dev *dev, uint8_t fblock, uint8_t ftype, const uin
         const uint8_t *r = data + TGT_OFF + rec * 11;
         uint32_t nt = le32(r), NtEnc = le32(r + 4);
         uint8_t par[3] = { r[8], r[9], r[10] };
-        uint32_t NtProbe = cr1_prng_successor(nt, median - TOLERANCE);
-        for (int m = median - TOLERANCE; m <= median + TOLERANCE; m += 2,
+        /* probe window [median-TOLERANCE, median+TOLERANCE], clamped at 0:
+         * a negative start would wrap the uint32 step count and spin. */
+        int mstart = median - TOLERANCE < 0 ? 0 : median - TOLERANCE;
+        uint32_t NtProbe = cr1_prng_successor(nt, (uint32_t)mstart);
+        for (int m = mstart; m <= median + TOLERANCE; m += 2,
              NtProbe = cr1_prng_successor(NtProbe, 2)) {
             uint32_t Ks1 = NtEnc ^ NtProbe;
             if (!valid_nonce(NtProbe, NtEnc, Ks1, par)) continue;

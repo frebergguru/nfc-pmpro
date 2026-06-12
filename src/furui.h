@@ -33,10 +33,6 @@ uint16_t furui_crc16(uint16_t initcrc, const uint8_t *data, size_t len);
 /* Build [len][payload][crc] into out (out must hold len+4). Returns total len. */
 size_t furui_frame(const uint8_t *payload, size_t len, uint8_t *out);
 
-/* Convenience: frame `payload`, zero-pad to 64, RC4-encrypt -> out64 (64 bytes).
- * Returns 1 on success (payload must be <= 60 bytes so framed <= 64). */
-int furui_build_report(const uint8_t *payload, size_t len, uint8_t out64[64]);
-
 /* Decrypt a received 64-byte report in place and return the framed length
  * (from the first two plaintext bytes). */
 uint16_t furui_decrypt_report(uint8_t buf[64]);

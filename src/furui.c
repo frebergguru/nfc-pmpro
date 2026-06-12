@@ -70,20 +70,6 @@ size_t furui_frame(const uint8_t *payload, size_t len, uint8_t *out)
     return total;
 }
 
-int furui_build_report(const uint8_t *payload, size_t len, uint8_t out64[64])
-{
-    if (len + 4 > 64)
-        return 0;
-    uint8_t plain[64];
-    memset(plain, 0, sizeof plain);
-    furui_frame(payload, len, plain);
-    uint8_t sbox[256];
-    furui_rc4_init(FURUI_DEVKEY, FURUI_DEVKEY_LEN, sbox);
-    furui_rc4_crypt(sbox, plain, 64);
-    memcpy(out64, plain, 64);
-    return 1;
-}
-
 uint16_t furui_decrypt_report(uint8_t buf[64])
 {
     uint8_t sbox[256];

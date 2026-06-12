@@ -22,9 +22,6 @@ char *pmpro_ascii(const unsigned char *data, size_t len, char *out, size_t n);
  * Returns number of bytes parsed, or -1 on malformed input. */
 int pmpro_parse_hex(const char *text, unsigned char *buf, size_t n);
 
-uint8_t pmpro_xor(const unsigned char *data, size_t len);
-uint8_t pmpro_sum(const unsigned char *data, size_t len);
-
 /* EM4100/EM4200: decode the 5 ID bytes (customer + 4 id bytes) into the common
  * renderings. Fills the provided buffers (each >= 32). Returns true if len>=5. */
 typedef struct {

@@ -61,22 +61,6 @@ int pmpro_parse_hex(const char *text, unsigned char *buf, size_t n)
     return (int)count;
 }
 
-uint8_t pmpro_xor(const unsigned char *data, size_t len)
-{
-    uint8_t c = 0;
-    for (size_t i = 0; i < len; ++i)
-        c ^= data[i];
-    return c;
-}
-
-uint8_t pmpro_sum(const unsigned char *data, size_t len)
-{
-    unsigned s = 0;
-    for (size_t i = 0; i < len; ++i)
-        s += data[i];
-    return (uint8_t)(s & 0xff);
-}
-
 bool pmpro_decode_em4100(const unsigned char *id_bytes, size_t len,
                          em4100_info *out)
 {
