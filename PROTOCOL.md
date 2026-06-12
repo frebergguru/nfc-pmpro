@@ -74,6 +74,26 @@ from ATQA+SAK). The `DeviceAgreement` DLL also carries command sets for **siblin
 devices** (`Icopy`, `Icopy5`, `OldFrratel`) and "hotel"/T5577 helpers at codes
 `0x40`–`0x45`; those return nothing on this PM-Pro (`FR-RATEL`) and are not used.
 
+### NDEF (application layer, on top of `17`/`18`)
+NDEF records aren't a device feature — they're a byte encoding written into Mifare
+Classic sectors with the ordinary read/write commands. The app lays out the **MAD**
+(MIFARE Application Directory) in sector 0 — AID `03 E1` for each NDEF sector, MAD
+key A `A0 A1 A2 A3 A4 A5`, GPB `C1` — and the NDEF message as a `03 … FE` TLV in the
+data sectors, whose trailers use NDEF key A `D3 F7 D3 F7 D3 F7` (GPB `40`). A phone
+authenticates the MAD, finds the NDEF sectors, and reads the TLV. Because the device
+can't write Ultralight/NTAG pages, this is Classic-only; Android reads NDEF-on-Classic,
+iOS does not. Encode/decode + mapping live in `src/ndef.c` (pure, unit-tested);
+`pmctl ndefencode` previews it offline. **Verified live (genuine 1K, UID a2 f6 79 89):**
+the NDEF **data sectors write and read back correctly** (sector 1 read back the exact
+`03 13 …NDEF… fe` TLV with the NDEF key), but the **MAD (sector 0) write is rejected** —
+a whole-sector `18` to sector 0 includes the read-only block 0, so the firmware refuses
+it and the sector-0 trailer key never changes. Since the device has no authenticated
+single-block write (only whole-sector `18` and format `16`), **the MAD can only be
+written on a magic (gen2/CUID) card**. Without the MAD a phone won't find the NDEF
+sectors, so phone-readable NDEF requires a magic card; on a genuine card only the data
+half lands (this app's own `ndefread` still reads it, as it scans the data sectors
+directly).
+
 ### Key-recovery ("decode") — the native engine *is* crapto1
 The 5 functions in the native DLL `72f1b856-…​.fr` (i386, cdecl) implement Crypto-1
 key recovery (`GetDetection/Half/All/FrxStatic/FrxDynamic_Decode_Card_Key`). The

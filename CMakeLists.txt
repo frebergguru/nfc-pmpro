@@ -54,7 +54,8 @@ add_executable(pmpro
     src/crack.c
     src/hardnested_glue.c
     src/nested.c
-    src/dump.c)
+    src/dump.c
+    src/ndef.c)
 
 target_include_directories(pmpro PRIVATE ${ADW_INCLUDE_DIRS} src)
 target_link_directories(pmpro PRIVATE ${ADW_LIBRARY_DIRS})
@@ -62,7 +63,7 @@ target_link_libraries(pmpro PRIVATE ${ADW_LIBRARIES} hardnested)
 target_compile_options(pmpro PRIVATE ${ADW_CFLAGS_OTHER})
 
 # CLI tools (no GTK) — protocol control + RE probe
-add_executable(pmctl src/pmctl.c src/hidraw.c src/furui.c src/session.c src/protocol.c src/crypto1.c src/crack.c src/hardnested_glue.c src/nested.c src/dump.c)
+add_executable(pmctl src/pmctl.c src/hidraw.c src/furui.c src/session.c src/protocol.c src/crypto1.c src/crack.c src/hardnested_glue.c src/nested.c src/dump.c src/ndef.c)
 target_link_libraries(pmctl PRIVATE hardnested)
 add_executable(pmprobe src/probe.c src/hidraw.c src/protocol.c)
 
@@ -70,13 +71,16 @@ add_executable(pmprobe src/probe.c src/hidraw.c src/protocol.c)
 add_executable(test_cipher   tests/test_cipher.c   src/crypto1.c)
 add_executable(test_recovery tests/test_recovery.c src/crypto1.c)
 add_executable(test_dump     tests/test_dump.c     src/dump.c src/protocol.c)
+add_executable(test_ndef     tests/test_ndef.c     src/ndef.c)
 target_include_directories(test_cipher   PRIVATE src)
 target_include_directories(test_recovery PRIVATE src)
 target_include_directories(test_dump     PRIVATE src)
+target_include_directories(test_ndef     PRIVATE src)
 enable_testing()
 add_test(NAME cipher   COMMAND test_cipher)
 add_test(NAME recovery COMMAND test_recovery)
 add_test(NAME dump     COMMAND test_dump)
+add_test(NAME ndef     COMMAND test_ndef)
 
 install(TARGETS pmpro pmctl RUNTIME DESTINATION bin)
 install(FILES data/com.furui.pmpro.desktop DESTINATION share/applications)

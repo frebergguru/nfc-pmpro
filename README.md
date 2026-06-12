@@ -80,14 +80,33 @@ blank, and whole-card tag operations:
   sector 0 via the device's `cmd 16` format (its block 0 is read-only), and
   **verifies every write by reading the sector back** — it won't claim a change it
   can't prove. Plus Copy/Erase for LF EM4100. (Lock is deferred — it is irreversible.)
+- **Records (NDEF)** — build and write NDEF records onto a Mifare Classic card,
+  and read them back. Supports **Text**, **URL / URI** (with the well-known scheme
+  prefixes — so http(s), `tel:`, `mailto:`, video / file links are all
+  covered), **Social media** (pick a platform — X, Instagram, LinkedIn, YouTube,
+  TikTok, GitHub, WhatsApp, … — plus a handle, and it builds the profile URL),
+  **Review / app link** (Google Review by Place ID, Google Maps, Yelp, Play Store /
+  App Store, Spotify, PayPal.me / Venmo / Cash App — you supply the business-specific
+  ID or paste the review link from your Google Business Profile; the app can't look
+  it up for you), **Smart Poster** (a URL with a title), **Contact** (vCard), **Android
+  Application Record**, **geo:** location, custom **MIME** and **External** types,
+  and a **raw** record editor — composed into a multi-record message. They're
+  stored via the MAD + NDEF mapping (NDEF key `D3F7D3F7D3F7`), so **Android phones
+  read them** (iOS does not read NDEF on Mifare Classic). This device has no
+  Ultralight/NTAG page write, so NDEF goes on Classic only — and because the MAD
+  lives in sector 0, a **magic (gen2/CUID) card** is needed for a phone-readable
+  tag (on a genuine card block 0 is read-only, so the data sectors get written but
+  the MAD doesn't — verified on hardware). CLI:
+  `pmctl ndefencode <type> …` (offline preview), `pmctl ndefwrite <type> …`,
+  `pmctl ndefread`.
 - **Card insight** — card-type detection (SAK/ATQA), decoded access conditions
   and value blocks (shown inline), and a per-sector **Key map** grid.
 - **Auto-read** — optionally poll and read a card automatically when placed.
 - **Write confirmations** — destructive writes ask before touching a card.
 
-The GUI has six tabs — **Device**, **HF · Mifare**, **LF · HID**, **Crack**,
-**Dump**, **Console** — each with its own log so an action's output appears next
-to it. Preferences (mute, default key, window size, imported `.keys`) persist in
+The GUI has seven tabs — **Device**, **HF · Mifare**, **LF · HID**, **Crack**,
+**Dump**, **Records**, **Console** — each with its own log so an action's output
+appears next to it. Preferences (mute, default key, window size, imported `.keys`) persist in
 `~/.config/pmpro/settings.ini`.
 
 The protocol (RC4 + CRC-16/CCITT + framing, full command table) is documented in
@@ -140,6 +159,7 @@ sudo cp tools/99-pmpro.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 - `src/protocol.[ch]` — hex/parse, card-type, value-block & access-condition decode.
 - `src/crack.c`, `nested.c`, `crypto1.c`, `hardnested_glue.c`, `hardnested/` — key recovery.
 - `src/dump.[ch]` — `.pmdump` / `.mfd` / `.keys` load · save · diff.
+- `src/ndef.[ch]` — NDEF records (encode/decode) + the Mifare Classic NDEF mapping.
 - `src/app.c` — GTK4/libadwaita GUI. `src/pmctl.c` — CLI. `src/probe.c` — RE probe.
 - `tests/` — Crypto-1 + dump/protocol self-tests (`ctest`).
 - `data/` — `.desktop` launcher + icon. `tools/99-pmpro.rules` — udev rule.

@@ -13,6 +13,7 @@
 #include "nested.h"
 #include "protocol.h"
 #include "dump.h"
+#include "ndef.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,52 @@ static void show(const char *tag, const uint8_t *d, size_t n)
 }
 
 static void cli_prog(const char *msg, void *u) { (void)u; printf("  %s\n", msg); fflush(stdout); }
+
+static const char *NDEF_USAGE =
+    "ndef type: text <lang> <text> | uri <uri> | sp <uri> <title> | geo <lat,lon> |\n"
+    "           social <platform> <handle> | service <name> <id|url> | aar <pkg> |\n"
+    "           vcard <name> [phone] [email] [org] [url] |\n"
+    "           mime <type> <data> | ext <domain:type> <data>";
+
+/* Build an NDEF message from argv starting at argv[base] (the record type). */
+static int build_ndef(int argc, char **argv, int base, ndef_message *m)
+{
+    ndef_msg_init(m);
+    if (base >= argc) return -1;
+    const char *t = argv[base];
+    int a = base + 1;
+    if (!strcmp(t, "text") && a + 1 < argc) return ndef_add_text(m, argv[a], argv[a + 1]);
+    if (!strcmp(t, "uri")  && a < argc)     return ndef_add_uri(m, argv[a]);
+    if (!strcmp(t, "geo")  && a < argc)     return ndef_add_geo(m, argv[a]);
+    if (!strcmp(t, "aar")  && a < argc)     return ndef_add_aar(m, argv[a]);
+    if (!strcmp(t, "sp")   && a + 1 < argc) return ndef_add_smartposter(m, argv[a], argv[a + 1], "en");
+    if (!strcmp(t, "social") && a + 1 < argc) return ndef_add_social(m, argv[a], argv[a + 1]);
+    if (!strcmp(t, "service") && a + 1 < argc) return ndef_add_service(m, argv[a], argv[a + 1]);
+    if (!strcmp(t, "mime") && a + 1 < argc)
+        return ndef_add_mime(m, argv[a], (const uint8_t *)argv[a + 1], strlen(argv[a + 1]));
+    if (!strcmp(t, "ext")  && a + 1 < argc)
+        return ndef_add_external(m, argv[a], (const uint8_t *)argv[a + 1], strlen(argv[a + 1]));
+    if (!strcmp(t, "vcard") && a < argc) {
+        ndef_vcard vc = {0};
+        vc.name = argv[a];
+        if (a + 1 < argc) vc.phone = argv[a + 1];
+        if (a + 2 < argc) vc.email = argv[a + 2];
+        if (a + 3 < argc) vc.org   = argv[a + 3];
+        if (a + 4 < argc) vc.url   = argv[a + 4];
+        return ndef_add_vcard(m, &vc);
+    }
+    return -1;
+}
+
+static void ndef_print(const ndef_message *m, int nl)
+{
+    printf("NDEF: %d record(s), %d bytes\n", m->n, nl);
+    for (int i = 0; i < m->n; i++) {
+        char d[NDEF_MAX_PAYLOAD + 128];
+        ndef_record_describe(&m->rec[i], d, sizeof d);
+        printf("  [%d] %s\n", i, d);
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -55,6 +102,24 @@ int main(int argc, char **argv)
         if (!pmpro_dump_load(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
         if (!pmpro_dump_save_auto(&d, argv[3], e, sizeof e)) { printf("%s\n", e); return 2; }
         printf("converted %s -> %s (%d sectors)\n", argv[2], argv[3], d.n_blocks);
+        return 0;
+    }
+
+    if (!strcmp(cmd, "ndefencode") && argc > 2) {
+        /* offline: build a message, print the NDEF bytes + the Mifare layout */
+        ndef_message m;
+        if (build_ndef(argc, argv, 2, &m) != 0) { printf("%s\n", NDEF_USAGE); return 2; }
+        uint8_t ndef[NDEF_MAX_MESSAGE];
+        int nl = ndef_encode(&m, ndef, sizeof ndef);
+        if (nl < 0) { printf("encode overflow\n"); return 2; }
+        ndef_print(&m, nl);
+        printf("bytes:"); for (int i = 0; i < nl; i++) printf(" %02x", ndef[i]); printf("\n");
+        uint8_t image[16][64]; memset(image, 0, sizeof image);
+        int used = 0;
+        if (ndef_to_mifare(ndef, (size_t)nl, NULL, 16, image, &used) == 0)
+            printf("Mifare 1K layout: sector 0 (MAD) + data sectors 1..%d\n", used);
+        else
+            printf("too large for a 1K NDEF tag (max ~720 bytes)\n");
         return 0;
     }
 
@@ -348,6 +413,77 @@ int main(int argc, char **argv)
         size_t r = furui_exec(&dev, p, 3, resp, sizeof resp, 8000);
         printf("cmd15 block=%d type=%d ack=%d len=%zu\n", block, type, r>=3&&resp[2]==1, r);
         if (r) { printf("resp(dec):"); for (size_t i=0;i<r && i<200;i++) printf(" %02x", resp[i]); printf("\n"); }
+    } else if (!strcmp(cmd, "ndefwrite") && argc > 2) {
+        /* Write an NDEF message to a Mifare Classic card. Tries the NDEF/MAD keys
+         * then the default key per sector, verifies by read-back, and keeps an
+         * already-present MAD (so an already-formatted genuine card works; a fresh
+         * magic card gets a new MAD). The GUI additionally recovers unknown keys. */
+        if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        ndef_message m;
+        if (build_ndef(argc, argv, 2, &m) != 0) { printf("%s\n", NDEF_USAGE); return 2; }
+        uint8_t ndef[NDEF_MAX_MESSAGE];
+        int nl = ndef_encode(&m, ndef, sizeof ndef);
+        if (nl < 0) { printf("encode overflow\n"); return 2; }
+        uint8_t ff[6]; memset(ff, 0xFF, 6);
+
+        /* read sector 0 (MAD key, else default) to preserve block 0 + see the MAD */
+        uint8_t s0[64], block0[16]; memset(block0, 0, 16);
+        int have_s0 = 0;
+        furui_activate(&dev);
+        if (furui_read_sector(&dev, 0, 1, NDEF_MAD_KEY, NULL, s0, sizeof s0) >= 16) have_s0 = 1;
+        else { furui_activate(&dev);
+               if (furui_read_sector(&dev, 0, 1, ff, NULL, s0, sizeof s0) >= 16) have_s0 = 1; }
+        if (have_s0) memcpy(block0, s0, 16);
+
+        uint8_t image[16][64]; memset(image, 0, sizeof image);
+        int used = 0;
+        if (ndef_to_mifare(ndef, (size_t)nl, block0, 16, image, &used) != 0) {
+            printf("message too large for a 1K NDEF tag\n"); return 2; }
+
+        int mad_ok = have_s0;
+        for (int s = 1; s <= used && mad_ok; s++)
+            if (s0[16 + 2 * s] != 0x03 || s0[16 + 2 * s + 1] != 0xE1) mad_ok = 0;
+
+        ndef_print(&m, nl);
+        printf(mad_ok ? "writing data sectors 1..%d (MAD already present)…\n"
+                      : "writing sector 0 (MAD) + data sectors 1..%d…\n", used);
+        int wrote = 0;
+        for (int s = 0; s <= used; s++) {
+            if (s == 0 && mad_ok) { printf("  sector 0: MAD already present — kept\n"); wrote++; continue; }
+            const uint8_t *ka = (s == 0) ? NDEF_MAD_KEY : NDEF_DATA_KEY;
+            furui_activate(&dev);
+            if (!furui_write_sector(&dev, (uint8_t)s, 1, ka, NULL, image[s], 64)) {
+                furui_activate(&dev);
+                furui_write_sector(&dev, (uint8_t)s, 1, ff, NULL, image[s], 64);
+            }
+            /* verify by reading the data blocks back (block 0 of sector 0 is kept) */
+            uint8_t rb[64]; int v = 0, st = (s == 0) ? 16 : 0;
+            furui_activate(&dev);
+            if (furui_read_sector(&dev, (uint8_t)s, 1, ka, NULL, rb, sizeof rb) >= 64
+                || furui_read_sector(&dev, (uint8_t)s, 1, ff, NULL, rb, sizeof rb) >= 64)
+                v = memcmp(rb + st, image[s] + st, 48 - st) == 0;
+            printf("  sector %d: %s\n", s, v ? "written" : "FAILED");
+            if (v) wrote++;
+        }
+        printf("wrote %d/%d sectors\n", wrote, used + 1);
+    } else if (!strcmp(cmd, "ndefread")) {
+        if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        uint8_t image[16][64]; memset(image, 0, sizeof image);
+        uint8_t ff[6]; memset(ff, 0xFF, 6);
+        for (int s = 0; s < 16; s++) {
+            const uint8_t *k = (s == 0) ? NDEF_MAD_KEY : NDEF_DATA_KEY;
+            furui_activate(&dev);
+            if (furui_read_sector(&dev, (uint8_t)s, 1, k, NULL, image[s], 64) < 16) {
+                furui_activate(&dev);                       /* fall back to default key */
+                furui_read_sector(&dev, (uint8_t)s, 1, ff, NULL, image[s], 64);
+            }
+        }
+        uint8_t ndef[NDEF_MAX_MESSAGE];
+        int nl = mifare_to_ndef((const uint8_t *)image, 16, ndef, sizeof ndef);
+        if (nl < 0) { printf("no NDEF message found (is the card NDEF-formatted?)\n"); return 1; }
+        ndef_message m;
+        if (ndef_decode(ndef, (size_t)nl, &m) < 0) { printf("NDEF parse error\n"); return 1; }
+        ndef_print(&m, nl);
     } else if (!strcmp(cmd, "raw") && argc > 2) {
         unsigned char payload[64];
         int n = pmpro_parse_hex(argv[2], payload, sizeof payload);
@@ -357,7 +493,9 @@ int main(int argc, char **argv)
         if (r) show("resp(dec)", resp, r < 64 ? r : 64);
         else printf("no/blank response\n");
     } else {
-        printf("usage: pmctl [connect|identify|magic|beep [t] [c]|raw <hex>]\n");
+        printf("usage: pmctl [connect|identify|magic|beep [t] [c]|raw <hex>]\n"
+               "       pmctl [ndefencode|ndefwrite] <type> <args…>   pmctl ndefread\n"
+               "       %s\n", NDEF_USAGE);
     }
     pmpro_close(&dev);
     return 0;

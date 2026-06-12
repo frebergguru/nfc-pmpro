@@ -21,6 +21,7 @@
 #include "nested.h"
 #include "protocol.h"
 #include "dump.h"
+#include "ndef.h"
 
 #define APP_ID "com.furui.pmpro"
 
@@ -68,6 +69,23 @@ typedef struct {
     GtkWidget *hex_entry;
     GtkTextBuffer *console_buf; GtkWidget *console_view;
 
+    /* Records (NDEF) tab */
+    GtkWidget *rec_type;             /* GtkDropDown: record type */
+    GtkWidget *rec_stack;            /* per-type field group, switched by rec_type */
+    GtkWidget *rec_text_lang, *rec_text_body;
+    GtkWidget *rec_uri;
+    GtkWidget *rec_sp_uri, *rec_sp_title;
+    GtkWidget *rec_vc_name, *rec_vc_phone, *rec_vc_email, *rec_vc_org, *rec_vc_url;
+    GtkWidget *rec_aar;
+    GtkWidget *rec_geo;
+    GtkWidget *rec_social_site, *rec_social_handle;
+    GtkWidget *rec_service_site, *rec_service_value;
+    GtkWidget *rec_mime_type, *rec_mime_data;
+    GtkWidget *rec_ext_type, *rec_ext_data;
+    GtkWidget *rec_raw_tnf, *rec_raw_type, *rec_raw_payload;
+    GtkTextBuffer *rec_buf; GtkWidget *rec_view;
+    ndef_message rec_msg;            /* the message being built (main-thread only) */
+
     AdwToastOverlay *toasts;
 
     pmpro_dump last;       /* read/loaded card buffer */
@@ -82,7 +100,7 @@ typedef struct {
 
 /* ---- UI marshalling (worker thread -> main loop) ----------------------- */
 
-enum { K_STATUS, K_TOAST, K_INFO, K_HF, K_LFHID, K_CRACK, K_DUMP, K_CONSOLE };
+enum { K_STATUS, K_TOAST, K_INFO, K_HF, K_LFHID, K_CRACK, K_DUMP, K_CONSOLE, K_RECORDS };
 
 typedef struct {
     App *a; int kind; int ok; char text[1024];
@@ -278,6 +296,7 @@ static gboolean ui_apply(gpointer p)
         else append_view(a->dump_buf, a->dump_view, m->text);
         break;
     case K_CONSOLE: append_view(a->console_buf, a->console_view, m->text); break;
+    case K_RECORDS: append_view(a->rec_buf, a->rec_view, m->text); break;
     }
     g_free(m);
     return G_SOURCE_REMOVE;
@@ -1003,6 +1022,138 @@ static gpointer w_copy_lf(gpointer p)
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
 }
 
+/* ---- Records (NDEF on Mifare Classic) ---------------------------------- */
+
+typedef struct { App *a; uint8_t ndef[NDEF_MAX_MESSAGE]; int nl; } NdefJob;
+
+/* Write one NDEF sector image. Try the sector as-is; if the card's current access
+ * bits block the found key from rewriting the trailer, factory-reset the sector to
+ * default keys + transport access (cmd16, which also handles sector 0) and retry. */
+static int ndef_write_sector(App *a, int s, const uint8_t img[64])
+{
+    int r = hf_write(a, s, img);
+    if (r == TW_OK) return TW_OK;
+    uint8_t fmt[64];
+    memset(fmt, 0, 48);
+    if (s == 0) memcpy(fmt, img, 16);            /* keep the manufacturer block */
+    memset(fmt + 48, 0xFF, 6);                   /* keyA -> FF */
+    memcpy(fmt + 54, ACC_DEFAULT, 4);            /* transport access */
+    memset(fmt + 58, 0xFF, 6);                   /* keyB -> FF */
+    if (hf_format_sector(a, s, fmt) != TW_OK) return r;   /* couldn't reset: keep verdict */
+    return hf_write(a, s, img);
+}
+
+static gpointer w_ndef_write(gpointer p)
+{
+    NdefJob *j = p; App *a = j->a;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        /* add the NDEF keys up front so reads/verification can authenticate the
+         * MAD and the new trailers */
+        furui_keys_add(NDEF_MAD_KEY);
+        furui_keys_add(NDEF_DATA_KEY);
+
+        /* preserve the manufacturer block (sector 0 block 0 is read-only) */
+        uint8_t block0[16]; memset(block0, 0, 16);
+        uint8_t s0[64], key[6]; int type;
+        int have_s0 = hf_read(a, 0, s0, key, &type);
+        if (have_s0) memcpy(block0, s0, 16);
+
+        uint8_t image[16][64]; memset(image, 0, sizeof image);
+        int used = 0;
+        if (ndef_to_mifare(j->ndef, (size_t)j->nl, block0, 16, image, &used) != 0) {
+            post(a, K_RECORDS, 0, "Message too large for a 1K NDEF tag (~720 bytes max).");
+            post(a, K_TOAST, 0, "NDEF too large");
+        } else {
+            /* If the card already carries a MAD that marks sectors 1..used as NDEF
+             * (AID 03 E1), keep it — we only need to (re)write the data sectors.
+             * This lets us write to an already-formatted *genuine* card, whose
+             * read-only block 0 would otherwise reject any sector-0 rewrite. */
+            int mad_ok = have_s0;
+            for (int s = 1; s <= used && mad_ok; s++)
+                if (s0[16 + 2 * s] != 0x03 || s0[16 + 2 * s + 1] != 0xE1) mad_ok = 0;
+
+            if (mad_ok)
+                post(a, K_RECORDS, 1, "Writing NDEF (%d bytes) → data sectors 1..%d (MAD already present)…",
+                     j->nl, used);
+            else
+                post(a, K_RECORDS, 1, "Writing NDEF (%d bytes) → MAD (sector 0) + data sectors 1..%d…",
+                     j->nl, used);
+
+            int done = 0, total = used + 1;
+            for (int s = 0; s <= used; s++) {
+                if (s == 0 && mad_ok) {
+                    post(a, K_RECORDS, 1, "  sector 0: MAD already present — kept");
+                    done++;
+                    continue;
+                }
+                int r = ndef_write_sector(a, s, image[s]);
+                if (r == TW_OK) {
+                    post(a, K_RECORDS, 1, "  sector %d: %s written", s, s == 0 ? "MAD" : "NDEF data");
+                    done++;
+                } else if (r == TW_NOKEY) {
+                    post(a, K_RECORDS, 0, "  sector %d: no working key (unknown/unrecoverable) — "
+                         "can't write here", s);
+                } else if (s == 0) {
+                    post(a, K_RECORDS, 0, "  sector 0 (MAD): write rejected — block 0 is read-only "
+                         "on a genuine card. Use a magic (gen2/CUID) card, or an already "
+                         "NDEF-formatted card.");
+                } else {
+                    post(a, K_RECORDS, 0, "  sector %d: write rejected — the trailer needs Key B "
+                         "and it couldn't be recovered", s);
+                }
+            }
+            if (done) app_beep(a);
+            if (done == total)
+                post(a, K_RECORDS, 1, "Wrote %d/%d sectors. Tap the card with an Android phone to read it.",
+                     done, total);
+            else
+                post(a, K_RECORDS, 0, "Wrote %d/%d sectors. The card must be writable with a known key, "
+                     "and writing the MAD (sector 0) needs a magic card unless the card is already "
+                     "NDEF-formatted.", done, total);
+            post(a, K_TOAST, done == total, "NDEF written (%d/%d)", done, total);
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
+}
+
+static gpointer w_ndef_read(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        furui_keys_add(NDEF_MAD_KEY);             /* so hf_read can authenticate them */
+        furui_keys_add(NDEF_DATA_KEY);
+        uint8_t image[16][64]; memset(image, 0, sizeof image);
+        for (int s = 0; s < 16; s++) {
+            uint8_t cur[64], key[6]; int type;
+            if (hf_read(a, s, cur, key, &type)) memcpy(image[s], cur, 64);
+        }
+        uint8_t ndef[NDEF_MAX_MESSAGE];
+        int nl = mifare_to_ndef((const uint8_t *)image, 16, ndef, sizeof ndef);
+        if (nl < 0) {
+            post(a, K_RECORDS, 0, "No NDEF message found — the card isn't NDEF-formatted "
+                 "(or its keys are unknown).");
+            post(a, K_TOAST, 0, "No NDEF found");
+        } else {
+            ndef_message m;
+            if (ndef_decode(ndef, (size_t)nl, &m) < 0) {
+                post(a, K_RECORDS, 0, "Found an NDEF TLV (%d bytes) but it didn't parse.", nl);
+            } else {
+                post(a, K_RECORDS, 1, "Read NDEF: %d record(s), %d bytes:", m.n, nl);
+                for (int i = 0; i < m.n; i++) {
+                    char d[NDEF_MAX_PAYLOAD + 128];
+                    ndef_record_describe(&m.rec[i], d, sizeof d);
+                    post(a, K_RECORDS, 1, "  [%d] %s", i, d);
+                }
+                post(a, K_TOAST, 1, "Read %d NDEF record(s)", m.n);
+                app_beep(a);
+            }
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
+}
+
 typedef struct { App *a; uint8_t block; uint8_t type; int mode; } CrackJob;
 
 static gpointer w_crack(gpointer p)
@@ -1294,6 +1445,117 @@ static void on_erase_lf(GtkButton *b, gpointer u)
 }
 
 static void on_copy_lf(GtkButton *b, gpointer u) { (void)b; start_op(u, w_copy_lf, NULL); }
+
+/* ---- Records (NDEF) callbacks (main thread) ---------------------------- */
+
+static const char *const REC_PAGES[] =
+    {"text", "uri", "social", "service", "sp", "vcard", "aar", "geo", "mime", "ext", "raw"};
+
+static void on_rectype_changed(GObject *o, GParamSpec *ps, gpointer u)
+{
+    (void)ps; App *a = u;
+    guint s = gtk_drop_down_get_selected(GTK_DROP_DOWN(o));
+    if (s < G_N_ELEMENTS(REC_PAGES))
+        gtk_stack_set_visible_child_name(GTK_STACK(a->rec_stack), REC_PAGES[s]);
+}
+
+/* append the currently-selected record type (from its fields) to rec_msg.
+ * Dispatches on the visible stack page name, so it's independent of dropdown order. */
+static int rec_append_current(App *a)
+{
+    const char *pg = gtk_stack_get_visible_child_name(GTK_STACK(a->rec_stack));
+    if (!pg) return -1;
+#define TXT(w) gtk_editable_get_text(GTK_EDITABLE(a->w))
+    if (!strcmp(pg, "text")) return ndef_add_text(&a->rec_msg, TXT(rec_text_lang), TXT(rec_text_body));
+    if (!strcmp(pg, "uri"))  return ndef_add_uri(&a->rec_msg, TXT(rec_uri));
+    if (!strcmp(pg, "sp"))   return ndef_add_smartposter(&a->rec_msg, TXT(rec_sp_uri), TXT(rec_sp_title), "en");
+    if (!strcmp(pg, "geo"))  return ndef_add_geo(&a->rec_msg, TXT(rec_geo));
+    if (!strcmp(pg, "aar"))  return ndef_add_aar(&a->rec_msg, TXT(rec_aar));
+    if (!strcmp(pg, "social")) {
+        guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(a->rec_social_site));
+        const char *platform = NDEF_SOCIAL[i].name;     /* table is the dropdown source */
+        return ndef_add_social(&a->rec_msg, platform, TXT(rec_social_handle));
+    }
+    if (!strcmp(pg, "service")) {
+        guint i = gtk_drop_down_get_selected(GTK_DROP_DOWN(a->rec_service_site));
+        return ndef_add_service(&a->rec_msg, NDEF_SERVICE[i].name, TXT(rec_service_value));
+    }
+    if (!strcmp(pg, "vcard")) {
+        ndef_vcard vc = {0};
+        vc.name = TXT(rec_vc_name); vc.phone = TXT(rec_vc_phone);
+        vc.email = TXT(rec_vc_email); vc.org = TXT(rec_vc_org); vc.url = TXT(rec_vc_url);
+        return ndef_add_vcard(&a->rec_msg, &vc);
+    }
+    if (!strcmp(pg, "mime")) { const char *d = TXT(rec_mime_data);
+        return ndef_add_mime(&a->rec_msg, TXT(rec_mime_type), (const uint8_t *)d, strlen(d)); }
+    if (!strcmp(pg, "ext")) { const char *d = TXT(rec_ext_data);
+        return ndef_add_external(&a->rec_msg, TXT(rec_ext_type), (const uint8_t *)d, strlen(d)); }
+    if (!strcmp(pg, "raw")) {
+        uint8_t type[64], pl[NDEF_MAX_PAYLOAD];
+        int tl = pmpro_parse_hex(TXT(rec_raw_type), type, sizeof type);
+        int pn = pmpro_parse_hex(TXT(rec_raw_payload), pl, sizeof pl);
+        if (tl < 0) tl = 0;
+        if (pn < 0) pn = 0;
+        return ndef_add_raw(&a->rec_msg, (uint8_t)atoi(TXT(rec_raw_tnf)), type, tl, pl, pn);
+    }
+#undef TXT
+    return -1;
+}
+
+static void on_ndef_add(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (a->rec_msg.n >= NDEF_MAX_RECORDS) { toast(a, "Message is full"); return; }
+    int before = a->rec_msg.n;
+    if (rec_append_current(a) != 0 || a->rec_msg.n == before) {
+        toast(a, "Fill in the record fields"); return;
+    }
+    char d[NDEF_MAX_PAYLOAD + 128];
+    ndef_record_describe(&a->rec_msg.rec[a->rec_msg.n - 1], d, sizeof d);
+    post(a, K_RECORDS, 1, "Added record [%d]: %s", a->rec_msg.n - 1, d);
+}
+
+static void on_ndef_clear(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    ndef_msg_init(&a->rec_msg);
+    post(a, K_RECORDS, 1, "Cleared — message is now empty.");
+}
+
+static void on_ndef_preview(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (a->rec_msg.n == 0) { toast(a, "Add a record first"); return; }
+    uint8_t ndef[NDEF_MAX_MESSAGE];
+    int nl = ndef_encode(&a->rec_msg, ndef, sizeof ndef);
+    if (nl < 0) { toast(a, "Message too large"); return; }
+    post(a, K_RECORDS, 1, "Preview: %d record(s), %d NDEF bytes", a->rec_msg.n, nl);
+    for (int i = 0; i < a->rec_msg.n; i++) {
+        char d[NDEF_MAX_PAYLOAD + 128];
+        ndef_record_describe(&a->rec_msg.rec[i], d, sizeof d);
+        post(a, K_RECORDS, 1, "  [%d] %s", i, d);
+    }
+    uint8_t image[16][64]; int used = 0;
+    if (ndef_to_mifare(ndef, (size_t)nl, NULL, 16, image, &used) == 0)
+        post(a, K_RECORDS, 1, "  → Mifare 1K: MAD (sector 0) + data sectors 1..%d", used);
+    else
+        post(a, K_RECORDS, 0, "  → too large for a 1K NDEF tag (~720 bytes max)");
+}
+
+static void on_ndef_write(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (a->rec_msg.n == 0) { toast(a, "Add at least one record first"); return; }
+    NdefJob *j = g_new0(NdefJob, 1);
+    j->a = a;
+    j->nl = ndef_encode(&a->rec_msg, j->ndef, sizeof j->ndef);
+    if (j->nl < 0) { g_free(j); toast(a, "Message too large"); return; }
+    confirm_write(a, "Write the NDEF message to the Mifare card? This rewrites sector 0 "
+                     "(the MAD) and the NDEF data sectors with the standard NDEF keys.",
+                  w_ndef_write, j);
+}
+
+static void on_ndef_read(GtkButton *b, gpointer u) { (void)b; start_op(u, w_ndef_read, NULL); }
 
 static void start_crack(App *a, int mode)
 {
@@ -1934,6 +2196,41 @@ static GtkWidget *entry_exp(const char *placeholder)
     return e;
 }
 
+/* a "<label>  [entry........]" row; creates the entry and returns it via *out */
+static GtkWidget *field_row(const char *label, const char *placeholder, GtkWidget **out)
+{
+    GtkWidget *row = hrow();
+    GtkWidget *l = gtk_label_new(label);
+    gtk_label_set_xalign(GTK_LABEL(l), 0);
+    gtk_widget_set_size_request(l, 80, -1);
+    gtk_box_append(GTK_BOX(row), l);
+    GtkWidget *e = entry_exp(placeholder);
+    gtk_box_append(GTK_BOX(row), e);
+    *out = e;
+    return row;
+}
+
+/* a "<label>  [dropdown]" row whose items are an ndef template table's names */
+static GtkWidget *table_dropdown_row(const char *label, const ndef_social_site *table,
+                                     GtkWidget **out)
+{
+    GtkWidget *row = hrow();
+    GtkWidget *l = gtk_label_new(label);
+    gtk_label_set_xalign(GTK_LABEL(l), 0);
+    gtk_widget_set_size_request(l, 80, -1);
+    gtk_box_append(GTK_BOX(row), l);
+    int n = 0;
+    while (table[n].name) n++;
+    const char **names = g_new0(const char *, n + 1);
+    for (int i = 0; i < n; i++) names[i] = table[i].name;
+    GtkWidget *d = gtk_drop_down_new_from_strings(names);
+    g_free(names);
+    gtk_widget_set_hexpand(d, TRUE);
+    gtk_box_append(GTK_BOX(row), d);
+    *out = d;
+    return row;
+}
+
 /* ---- pages ------------------------------------------------------------- */
 
 static GtkWidget *page_device(App *a)
@@ -1969,6 +2266,7 @@ static GtkWidget *page_device(App *a)
         "• LF / HID: read & write 125 kHz EM4100/T5577 and HID prox cards.\n"
         "• Crack: recover Mifare keys (dictionary / nested / darkside / hardnested) and autopwn.\n"
         "• Dump: load/save/export (.pmdump or raw .mfd), edit a block, diff two dumps.\n"
+        "• Records: write/read NDEF records (Text, URL, contact, app, …) on a Classic card.\n"
         "• Console: send raw protocol payloads.\n\n"
         "Use only on cards you own or are authorized to test."));
     return box;
@@ -2222,6 +2520,133 @@ static GtkWidget *page_console(App *a)
     return box;
 }
 
+static GtkWidget *rec_group(void)
+{
+    GtkWidget *b = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    return b;
+}
+
+static GtkWidget *page_records(App *a)
+{
+    GtkWidget *box = page_box();
+    ndef_msg_init(&a->rec_msg);
+
+    gtk_box_append(GTK_BOX(box), section_label("Build an NDEF record"));
+
+    /* type selector */
+    GtkWidget *tr = hrow();
+    gtk_box_append(GTK_BOX(tr), gtk_label_new("Type"));
+    const char *types[] = {
+        "Text", "URL / URI", "Social media", "Review / app link",
+        "Smart Poster (URL + title)", "Contact (vCard)", "Android App (AAR)",
+        "Geo location", "MIME (custom)", "External (custom)", "Raw record", NULL
+    };
+    a->rec_type = gtk_drop_down_new_from_strings(types);
+    gtk_widget_set_hexpand(a->rec_type, TRUE);
+    gtk_box_append(GTK_BOX(tr), a->rec_type);
+    gtk_box_append(GTK_BOX(box), tr);
+
+    /* per-type field groups, switched by the dropdown */
+    a->rec_stack = gtk_stack_new();
+    GtkWidget *g;
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("Language", "en", &a->rec_text_lang));
+    gtk_box_append(GTK_BOX(g), field_row("Text", "Hello from NFC", &a->rec_text_body));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "text");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("URI", "https://example.com  ·  tel:+1…  ·  mailto:a@b.com", &a->rec_uri));
+    gtk_box_append(GTK_BOX(g), hint_label("Any URI works — web links, phone, mail, social, "
+        "video or file URLs. Common schemes are abbreviated to one byte automatically."));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "uri");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), table_dropdown_row("Platform", NDEF_SOCIAL, &a->rec_social_site));
+    gtk_box_append(GTK_BOX(g), field_row("Handle", "username (or phone for WhatsApp)", &a->rec_social_handle));
+    gtk_box_append(GTK_BOX(g), hint_label("Builds the profile URL for the chosen platform "
+        "(a leading @ is trimmed). Paste a full https:// link to use it verbatim."));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "social");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), table_dropdown_row("Service", NDEF_SERVICE, &a->rec_service_site));
+    gtk_box_append(GTK_BOX(g), field_row("ID / URL", "Place ID, package, username — or a full https:// link", &a->rec_service_value));
+    gtk_box_append(GTK_BOX(g), hint_label("For Google Review: paste your Place ID, or the full "
+        "review link from your Google Business Profile (g.page/r/…/review). The business-specific "
+        "ID/link must come from you — the app can't look it up."));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "service");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("URL", "https://example.com", &a->rec_sp_uri));
+    gtk_box_append(GTK_BOX(g), field_row("Title", "A label shown with the link", &a->rec_sp_title));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "sp");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("Name", "Ada Lovelace", &a->rec_vc_name));
+    gtk_box_append(GTK_BOX(g), field_row("Phone", "+1 555 1234", &a->rec_vc_phone));
+    gtk_box_append(GTK_BOX(g), field_row("Email", "ada@example.io", &a->rec_vc_email));
+    gtk_box_append(GTK_BOX(g), field_row("Org", "Analytical Engines", &a->rec_vc_org));
+    gtk_box_append(GTK_BOX(g), field_row("URL", "https://example.io", &a->rec_vc_url));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "vcard");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("Package", "com.example.app", &a->rec_aar));
+    gtk_box_append(GTK_BOX(g), hint_label("Android Application Record — a phone opens this app, "
+        "or the Play Store page if it isn't installed."));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "aar");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("Lat,Lon", "59.9139,10.7522", &a->rec_geo));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "geo");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("MIME type", "application/json", &a->rec_mime_type));
+    gtk_box_append(GTK_BOX(g), field_row("Data", "{\"k\":1}", &a->rec_mime_data));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "mime");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("Type", "example.com:myrec", &a->rec_ext_type));
+    gtk_box_append(GTK_BOX(g), field_row("Data", "payload text", &a->rec_ext_data));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "ext");
+
+    g = rec_group();
+    gtk_box_append(GTK_BOX(g), field_row("TNF", "1  (0=empty 1=well-known 2=MIME 4=external)", &a->rec_raw_tnf));
+    gtk_box_append(GTK_BOX(g), field_row("Type hex", "55", &a->rec_raw_type));
+    gtk_box_append(GTK_BOX(g), field_row("Payload hex", "04 65 78 …", &a->rec_raw_payload));
+    gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "raw");
+
+    gtk_box_append(GTK_BOX(box), a->rec_stack);
+    g_signal_connect(a->rec_type, "notify::selected", G_CALLBACK(on_rectype_changed), a);
+
+    /* compose / preview */
+    GtkWidget *cr = hrow();
+    gtk_box_append(GTK_BOX(cr), btn("Add record", "suggested-action", G_CALLBACK(on_ndef_add), a));
+    gtk_box_append(GTK_BOX(cr), btn("Preview", NULL, G_CALLBACK(on_ndef_preview), a));
+    gtk_box_append(GTK_BOX(cr), btn("Clear", NULL, G_CALLBACK(on_ndef_clear), a));
+    gtk_box_append(GTK_BOX(box), cr);
+
+    /* card I/O */
+    gtk_box_append(GTK_BOX(box), section_label("Card"));
+    GtkWidget *io = hrow();
+    gtk_box_append(GTK_BOX(io), btn("Read records", "suggested-action", G_CALLBACK(on_ndef_read), a));
+    gtk_box_append(GTK_BOX(io), btn("Write to card", "destructive-action", G_CALLBACK(on_ndef_write), a));
+    gtk_box_append(GTK_BOX(box), io);
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "Records are written onto a Mifare Classic card (MAD + NDEF mapping) — the only "
+        "NDEF storage this device can write. Android phones read NDEF-on-Classic; iPhones "
+        "do not. Use a magic (gen2/CUID) card: the MAD lives in sector 0, and on a genuine "
+        "card block 0 is read-only so the MAD can't be written (the data sectors still get "
+        "written, but a phone won't find them without the MAD). Unknown keys are recovered "
+        "automatically (dictionary → nested)."));
+
+    GtkWidget *rv = mono_view(&a->rec_buf,
+        "Build a record (pick a type, fill the fields, Add record), then Write to card.\n"
+        "Read records parses an NDEF-formatted card back into a list.\n\n");
+    a->rec_view = rv;
+    gtk_box_append(GTK_BOX(box), scrolled(rv));
+    return box;
+}
+
 static void load_css(void)
 {
     GtkCssProvider *p = gtk_css_provider_new();
@@ -2248,9 +2673,9 @@ static void activate(GtkApplication *gapp, gpointer user)
     GtkWidget *win = adw_application_window_new(gapp);
     a->win = GTK_WINDOW(win);
     gtk_window_set_title(GTK_WINDOW(win), "NFC PM-Pro");
-    gtk_window_set_default_size(GTK_WINDOW(win), 1180, 700);
-    /* keep the window wide enough that the 6-tab view switcher shows full labels */
-    gtk_widget_set_size_request(win, 1000, 560);
+    gtk_window_set_default_size(GTK_WINDOW(win), 1320, 700);
+    /* keep the window wide enough that the 7-tab view switcher shows full labels */
+    gtk_widget_set_size_request(win, 1100, 560);
 
     GtkWidget *toolbar = adw_toolbar_view_new();
     GtkWidget *header = adw_header_bar_new();
@@ -2270,6 +2695,8 @@ static void activate(GtkApplication *gapp, gpointer user)
         "crack", "Crack", "dialog-password-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_dump(a),
         "dump", "Dump", "document-save-symbolic");
+    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_records(a),
+        "records", "Records", "emblem-documents-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_console(a),
         "console", "Console", "utilities-terminal-symbolic");
 
