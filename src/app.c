@@ -70,6 +70,11 @@ typedef struct {
     pmpro_dump last;       /* read/loaded card buffer */
     gboolean have_last;
     uint8_t cur_key[6];    /* key for the next sector read (main->worker) */
+
+    gboolean auto_read;    /* poll + auto-read on card detect */
+    guint poll_id;         /* g_timeout source id (0 = none) */
+    uint8_t poll_uid[10];  /* last seen UID (debounce) */
+    int poll_uid_len;
 } App;
 
 /* ---- UI marshalling (worker thread -> main loop) ----------------------- */
@@ -386,6 +391,64 @@ static gpointer w_openfind(gpointer p)
     return NULL;
 }
 
+/* read a detected HF card's sectors into the buffer + post them (holds lock) */
+static void read_hf_show(App *a, furui_hf_card *c)
+{
+    uid_info ui; pmpro_decode_uid(c->uid, c->uid_len, &ui);
+    char tail[32];
+    pmpro_hex(c->tail, c->tail_len, tail, sizeof tail);
+    post(a, K_HF, 1, "HF (13.56 MHz)  UID: %s (%d-byte)   [ATQA/SAK: %s]",
+         ui.uid, ui.uid_len, tail);
+    pmpro_dump_init(&a->last);
+    snprintf(a->last.card_type, sizeof a->last.card_type, "ISO14443A");
+    snprintf(a->last.frequency, sizeof a->last.frequency, "13.56MHz");
+    snprintf(a->last.uid, sizeof a->last.uid, "%s", ui.uid);
+    a->have_last = TRUE;
+    char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
+    uint16_t atqa = c->tail_len >= 2 ? (c->tail[0] | (uint16_t)c->tail[1] << 8) : 0;
+    int sak0 = -1;
+    int open_sectors = 0;
+    for (int s = 0; s < 16; s++) {
+        uint8_t blk[64], usekey[6];
+        int usetype = -1;
+        furui_activate(&a->dev);
+        size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL, blk, sizeof blk);
+        if (bl >= 64) { memcpy(usekey, a->cur_key, 6); usetype = 0; }
+        if (usetype < 0) {
+            uint8_t fk[6];
+            if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 0, fk)) {
+                furui_activate(&a->dev);
+                bl = furui_read_sector(&a->dev, (uint8_t)s, 1, fk, NULL, blk, sizeof blk);
+                if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 0; }
+            }
+            if (usetype < 0 && furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, fk)) {
+                furui_activate(&a->dev);
+                bl = furui_read_sector(&a->dev, (uint8_t)s, 2, NULL, fk, blk, sizeof blk);
+                if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 1; }
+            }
+        }
+        if (usetype >= 0) {
+            open_sectors++;
+            if (s == 0) sak0 = blk[5];
+            if (usetype == 0) memcpy(blk + 48, usekey, 6);
+            else              memcpy(blk + 58, usekey, 6);
+            char h[200]; pmpro_hex(blk, 64, h, sizeof h);
+            pmpro_dump_add_block(&a->last, h);
+            post_sector(a, K_HF, s, blk, 64);
+        }
+    }
+    const char *ct = pmpro_card_type(sak0 >= 0 ? (uint8_t)sak0 : 0xFF, atqa, NULL);
+    post(a, K_HF, 1, "Type: %s", ct);
+    snprintf(a->last.card_type, sizeof a->last.card_type, "%s", ct);
+    if (!open_sectors)
+        post(a, K_HF, 0, "no sectors readable (tried key %s + dictionary). "
+             "Recover keys on the Crack tab, load a .keys file, or import a dump's keys.", kh);
+    else
+        post(a, K_HF, 1, "%d/16 sectors → buffer (Clone, or the Dump tab)", open_sectors);
+    post(a, K_TOAST, 1, "HF card read");
+    app_beep(a);
+}
+
 static gpointer w_read_hf(gpointer p)
 {
     App *a = p;
@@ -393,69 +456,33 @@ static gpointer w_read_hf(gpointer p)
     if (ensure_ready(a)) {
         furui_hf_card c;
         if (furui_read_hf(&a->dev, &c)) {
-            uid_info ui; pmpro_decode_uid(c.uid, c.uid_len, &ui);
-            char tail[32];
-            pmpro_hex(c.tail, c.tail_len, tail, sizeof tail);
-            post(a, K_HF, 1, "HF (13.56 MHz)  UID: %s (%d-byte)   [ATQA/SAK: %s]",
-                 ui.uid, ui.uid_len, tail);
-            pmpro_dump_init(&a->last);
-            snprintf(a->last.card_type, sizeof a->last.card_type, "ISO14443A");
-            snprintf(a->last.frequency, sizeof a->last.frequency, "13.56MHz");
-            snprintf(a->last.uid, sizeof a->last.uid, "%s", ui.uid);
-            a->have_last = TRUE;
-            char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
-            uint16_t atqa = c.tail_len >= 2 ? (c.tail[0] | (uint16_t)c.tail[1] << 8) : 0;
-            int sak0 = -1;             /* SAK from sector 0 block 0, when read */
-            int open_sectors = 0;
-            for (int s = 0; s < 16; s++) {
-                uint8_t blk[64], usekey[6];
-                int usetype = -1;          /* -1 none, 0 key A, 1 key B */
-                /* 1) the key in the box, as key A */
-                furui_activate(&a->dev);
-                size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL, blk, sizeof blk);
-                if (bl >= 64) { memcpy(usekey, a->cur_key, 6); usetype = 0; }
-                /* 2) else the dictionary (built-in + loaded .keys + dump keys) */
-                if (usetype < 0) {
-                    uint8_t fk[6];
-                    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 0, fk)) {
-                        furui_activate(&a->dev);
-                        bl = furui_read_sector(&a->dev, (uint8_t)s, 1, fk, NULL, blk, sizeof blk);
-                        if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 0; }
-                    }
-                    if (usetype < 0 && furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, fk)) {
-                        furui_activate(&a->dev);
-                        bl = furui_read_sector(&a->dev, (uint8_t)s, 2, NULL, fk, blk, sizeof blk);
-                        if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 1; }
-                    }
-                }
-                if (usetype >= 0) {
-                    open_sectors++;
-                    if (s == 0) sak0 = blk[5];   /* block 0: UID·BCC·SAK·ATQA */
-                    /* device masks keyA on read — restore the key we authenticated with */
-                    if (usetype == 0) memcpy(blk + 48, usekey, 6);
-                    else              memcpy(blk + 58, usekey, 6);
-                    char h[200]; pmpro_hex(blk, 64, h, sizeof h);
-                    pmpro_dump_add_block(&a->last, h);
-                    post_sector(a, K_HF, s, blk, 64);
-                }
-            }
-            {
-                const char *ct = pmpro_card_type(sak0 >= 0 ? (uint8_t)sak0 : 0xFF, atqa, NULL);
-                post(a, K_HF, 1, "Type: %s", ct);
-                snprintf(a->last.card_type, sizeof a->last.card_type, "%s", ct);
-            }
-            if (!open_sectors)
-                post(a, K_HF, 0, "no sectors readable (tried key %s + dictionary). "
-                     "Recover keys on the Crack tab, load a .keys file, or import "
-                     "a dump's keys.", kh);
-            else
-                post(a, K_HF, 1, "%d/16 sectors → buffer (Clone, or the Dump tab)",
-                     open_sectors);
-            post(a, K_TOAST, 1, "HF card read");
-            app_beep(a);
+            memcpy(a->poll_uid, c.uid, c.uid_len); a->poll_uid_len = c.uid_len;
+            read_hf_show(a, &c);
         } else {
             post(a, K_HF, 0, "HF: no card on reader");
             post(a, K_TOAST, 0, "No HF card");
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE);
+    g_mutex_unlock(&a->lock);
+    return NULL;
+}
+
+/* auto-read poll worker: if a new card appeared since last poll, read it */
+static gpointer w_autoread(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (a->connected) {
+        furui_hf_card c;
+        if (furui_read_hf(&a->dev, &c)) {
+            if (c.uid_len != a->poll_uid_len ||
+                memcmp(c.uid, a->poll_uid, c.uid_len) != 0) {
+                memcpy(a->poll_uid, c.uid, c.uid_len); a->poll_uid_len = c.uid_len;
+                read_hf_show(a, &c);
+            }
+        } else {
+            a->poll_uid_len = 0;   /* card removed → re-read next time it returns */
         }
     }
     g_atomic_int_set(&a->busy, FALSE);
@@ -717,6 +744,55 @@ static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
     return TRUE;
 }
 
+/* confirm-before-write: present an AdwAlertDialog; on "write" run the op. */
+typedef struct { App *a; GThreadFunc fn; gpointer job; } ConfirmCtx;
+
+static void confirm_resp(AdwAlertDialog *dlg, const char *resp, gpointer u)
+{
+    (void)dlg;
+    ConfirmCtx *c = u;
+    if (g_strcmp0(resp, "write") == 0)
+        start_op(c->a, c->fn, c->job);
+    else if (c->job)
+        g_free(c->job);
+    g_free(c);
+}
+
+static void confirm_write(App *a, const char *body, GThreadFunc fn, gpointer job)
+{
+    AdwDialog *dlg = adw_alert_dialog_new("Write to card?", body);
+    adw_alert_dialog_add_responses(ADW_ALERT_DIALOG(dlg), "cancel", "Cancel", "write", "Write", NULL);
+    adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(dlg), "write", ADW_RESPONSE_DESTRUCTIVE);
+    adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(dlg), "cancel");
+    adw_alert_dialog_set_close_response(ADW_ALERT_DIALOG(dlg), "cancel");
+    ConfirmCtx *c = g_new0(ConfirmCtx, 1);
+    c->a = a; c->fn = fn; c->job = job;
+    g_signal_connect(dlg, "response", G_CALLBACK(confirm_resp), c);
+    adw_dialog_present(dlg, GTK_WIDGET(a->win));
+}
+
+/* auto-read: a timer kicks a poll worker when idle + connected */
+static gboolean poll_tick(gpointer u)
+{
+    App *a = u;
+    if (!a->auto_read) { a->poll_id = 0; return G_SOURCE_REMOVE; }
+    if (a->connected && g_atomic_int_compare_and_exchange(&a->busy, FALSE, TRUE))
+        g_thread_unref(g_thread_new("pmpro-poll", w_autoread, a));
+    return G_SOURCE_CONTINUE;
+}
+
+static void on_auto_toggle(GtkCheckButton *b, gpointer u)
+{
+    App *a = u;
+    a->auto_read = gtk_check_button_get_active(b);
+    if (a->auto_read && !a->poll_id)
+        a->poll_id = g_timeout_add(1500, poll_tick, a);
+    else if (!a->auto_read && a->poll_id) {
+        g_source_remove(a->poll_id);
+        a->poll_id = 0;
+    }
+}
+
 /* ---- button callbacks (main thread) ------------------------------------ */
 
 static void settings_save(App *a);   /* fwd: defined with the settings code */
@@ -774,7 +850,7 @@ static void on_write_lf(GtkButton *b, gpointer u)
     j->payload[0] = 0x2D;
     memcpy(j->payload + 1, fields, 6);
     j->len = 7;
-    start_op(a, w_write_lf, j);
+    confirm_write(a, "Write the 125 kHz LF card?", w_write_lf, j);
 }
 
 static void on_write_hid(GtkButton *b, gpointer u)
@@ -785,7 +861,7 @@ static void on_write_hid(GtkButton *b, gpointer u)
     if (pmpro_parse_hex(t, j->id, 12) != 12) {
         g_free(j); toast(a, "HID needs a 12-byte card id in hex"); return;
     }
-    start_op(a, w_write_hid, j);
+    confirm_write(a, "Write the HID prox card?", w_write_hid, j);
 }
 
 static void on_write_sector(GtkButton *b, gpointer u)
@@ -799,7 +875,9 @@ static void on_write_sector(GtkButton *b, gpointer u)
     int dl = pmpro_parse_hex(dt, j->data, sizeof j->data);
     if (dl <= 0) { g_free(j); toast(a, "Enter sector data hex"); return; }
     j->datalen = dl;
-    start_op(a, w_write_sector, j);
+    char msg[96];
+    snprintf(msg, sizeof msg, "Overwrite sector %d on the card?", j->sector);
+    confirm_write(a, msg, w_write_sector, j);
 }
 
 static void on_format(GtkButton *b, gpointer u)
@@ -809,7 +887,9 @@ static void on_format(GtkButton *b, gpointer u)
     j->sector = (uint8_t)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->fmt_sector));
     const char *kt = gtk_editable_get_text(GTK_EDITABLE(a->fmt_key));
     if (pmpro_parse_hex(kt, j->key, 6) != 6) memset(j->key, 0xFF, 6);
-    start_op(a, w_format, j);
+    char msg[96];
+    snprintf(msg, sizeof msg, "Format (erase) sector %d to defaults?", j->sector);
+    confirm_write(a, msg, w_format, j);
 }
 
 static void on_write_buffer(GtkButton *b, gpointer u)
@@ -818,7 +898,7 @@ static void on_write_buffer(GtkButton *b, gpointer u)
     CloneJob *j = g_new0(CloneJob, 1); j->a = a;
     const char *kt = gtk_editable_get_text(GTK_EDITABLE(a->clone_key));
     if (pmpro_parse_hex(kt, j->key, 6) != 6) memset(j->key, 0xFF, 6);
-    start_op(a, w_write_buffer, j);
+    confirm_write(a, "Write the buffer to the card? This overwrites its sectors.", w_write_buffer, j);
 }
 
 static void start_crack(App *a, int mode)
@@ -1172,6 +1252,62 @@ static void on_diff(GtkButton *b, gpointer u)
     gtk_file_dialog_open(d, a->win, NULL, on_diff_finish, a);
 }
 
+/* ---- key map: per-sector A/B grid from the buffer trailers ------------- */
+
+static void keymap_label(GtkWidget *grid, int col, int row, const char *markup)
+{
+    GtkWidget *l = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(l), markup);
+    gtk_label_set_xalign(GTK_LABEL(l), 0);
+    gtk_label_set_selectable(GTK_LABEL(l), TRUE);
+    gtk_grid_attach(GTK_GRID(grid), l, col, row, 1, 1);
+}
+
+static void on_keymap(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last || a->last.n_blocks == 0) { toast(a, "Buffer empty — read or load a card first"); return; }
+
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Key map");
+    gtk_window_set_transient_for(GTK_WINDOW(win), a->win);
+    gtk_window_set_default_size(GTK_WINDOW(win), 460, 620);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 20);
+    gtk_widget_set_margin_start(grid, 14); gtk_widget_set_margin_end(grid, 14);
+    gtk_widget_set_margin_top(grid, 14); gtk_widget_set_margin_bottom(grid, 14);
+
+    keymap_label(grid, 0, 0, "<b>Sector</b>");
+    keymap_label(grid, 1, 0, "<b>Key A</b>");
+    keymap_label(grid, 2, 0, "<b>Key B</b>");
+
+    static const unsigned char zero[6] = {0};
+    for (int i = 0; i < a->last.n_blocks; i++) {
+        uint8_t d[256];
+        int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
+        if (n < 16) continue;
+        int tr = ((n / 16) - 1) * 16;
+        char ka[96], kb[96], sec[16];
+        snprintf(sec, sizeof sec, "%d", i);
+        if (memcmp(d + tr, zero, 6))
+            snprintf(ka, sizeof ka, "<span foreground='#2ec27e' font_family='monospace'>"
+                     "%02x%02x%02x%02x%02x%02x</span>", d[tr],d[tr+1],d[tr+2],d[tr+3],d[tr+4],d[tr+5]);
+        else snprintf(ka, sizeof ka, "<span foreground='#9a9a9a'>—</span>");
+        if (memcmp(d + tr + 10, zero, 6))
+            snprintf(kb, sizeof kb, "<span foreground='#3584e4' font_family='monospace'>"
+                     "%02x%02x%02x%02x%02x%02x</span>", d[tr+10],d[tr+11],d[tr+12],d[tr+13],d[tr+14],d[tr+15]);
+        else snprintf(kb, sizeof kb, "<span foreground='#9a9a9a'>—</span>");
+        keymap_label(grid, 0, i + 1, sec);
+        keymap_label(grid, 1, i + 1, ka);
+        keymap_label(grid, 2, i + 1, kb);
+    }
+
+    gtk_window_set_child(GTK_WINDOW(win), scrolled(grid));
+    gtk_window_present(GTK_WINDOW(win));
+}
+
 /* ---- crack tab: load keys + autopwn ------------------------------------ */
 
 static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
@@ -1451,6 +1587,11 @@ static GtkWidget *page_hf(App *a)
     a->key_entry = entry_exp("FF FF FF FF FF FF (default)");
     gtk_box_append(GTK_BOX(r0), a->key_entry);
     gtk_box_append(GTK_BOX(r0), btn("Read HF", "suggested-action", G_CALLBACK(on_read_hf), a));
+    GtkWidget *autochk = gtk_check_button_new_with_label("Auto-read");
+    gtk_widget_set_tooltip_text(autochk, "Poll the reader and read automatically "
+        "when a (new) card is placed (requires Connect)");
+    g_signal_connect(autochk, "toggled", G_CALLBACK(on_auto_toggle), a);
+    gtk_box_append(GTK_BOX(r0), autochk);
     gtk_box_append(GTK_BOX(box), r0);
 
     /* write sector */
@@ -1556,6 +1697,10 @@ static GtkWidget *page_crack(App *a)
     gtk_widget_set_tooltip_text(lkeys, "Import a MifareClassicTool .keys file; the keys "
         "extend the dictionary used by Dictionary/Nested/Autopwn (remembered across launches)");
     gtk_box_append(GTK_BOX(arow), lkeys);
+    GtkWidget *kmap = btn("Key map", NULL, G_CALLBACK(on_keymap), a);
+    gtk_widget_set_tooltip_text(kmap, "Show a per-sector Key A / Key B table from the "
+        "current buffer (read or load a card first)");
+    gtk_box_append(GTK_BOX(arow), kmap);
     gtk_box_append(GTK_BOX(box), arow);
 
     GtkWidget *cv = mono_view(&a->crack_buf,

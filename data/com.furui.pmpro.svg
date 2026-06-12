@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <rect x="6" y="12" width="52" height="40" rx="6" fill="#3584e4"/>
+  <rect x="6" y="12" width="52" height="40" rx="6" fill="none" stroke="#1a5fb4" stroke-width="2"/>
+  <!-- chip -->
+  <rect x="13" y="22" width="14" height="11" rx="2" fill="#f5c211"/>
+  <rect x="13" y="22" width="14" height="11" rx="2" fill="none" stroke="#9a7400" stroke-width="1"/>
+  <line x1="20" y1="22" x2="20" y2="33" stroke="#9a7400" stroke-width="1"/>
+  <line x1="13" y1="27.5" x2="27" y2="27.5" stroke="#9a7400" stroke-width="1"/>
+  <!-- NFC waves -->
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round">
+    <path d="M40 24 a10 10 0 0 1 0 16"/>
+    <path d="M45 20 a16 16 0 0 1 0 24"/>
+    <path d="M50 16 a22 22 0 0 1 0 32"/>
+  </g>
+</svg>

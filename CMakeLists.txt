@@ -79,3 +79,12 @@ add_test(NAME recovery COMMAND test_recovery)
 add_test(NAME dump     COMMAND test_dump)
 
 install(TARGETS pmpro pmctl RUNTIME DESTINATION bin)
+install(FILES data/com.furui.pmpro.desktop DESTINATION share/applications)
+install(FILES data/com.furui.pmpro.svg
+        DESTINATION share/icons/hicolor/scalable/apps)
+
+# Refresh the desktop + icon caches after a system install (best-effort).
+install(CODE "
+  execute_process(COMMAND update-desktop-database \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/applications\" ERROR_QUIET)
+  execute_process(COMMAND gtk-update-icon-cache -f -t \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/icons/hicolor\" ERROR_QUIET)
+")

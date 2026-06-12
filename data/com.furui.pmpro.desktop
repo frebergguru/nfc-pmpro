@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NFC PM-Pro
+GenericName=RFID reader/writer
+Comment=Companion app for the FURUI NFC PM-Pro RFID copier
+Exec=pmpro
+Icon=com.furui.pmpro
+Terminal=false
+Categories=Utility;Security;
+Keywords=NFC;RFID;Mifare;125kHz;13.56MHz;HID;EM4100;
+StartupNotify=true
