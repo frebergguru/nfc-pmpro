@@ -10,6 +10,7 @@
 #include "hardnested_glue.h"
 #include "nested.h"
 #include "protocol.h"
+#include "dump.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,27 @@ static void cli_prog(const char *msg, void *u) { (void)u; printf("  %s\n", msg);
 int main(int argc, char **argv)
 {
     const char *cmd = argc > 1 ? argv[1] : "connect";
+
+    /* offline .pmdump tools — no device needed, handle before opening hidraw */
+    if (!strcmp(cmd, "dumpdiff") && argc > 3) {
+        static pmpro_dump da, db; char e[128];
+        if (!pmpro_dump_load(&da, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
+        if (!pmpro_dump_load(&db, argv[3], e, sizeof e)) { printf("%s\n", e); return 2; }
+        static char buf[16384];
+        int n = pmpro_dump_diff(&da, &db, buf, sizeof buf);
+        printf("%s%d difference(s)\n", buf, n);
+        return 0;
+    }
+    if (!strcmp(cmd, "dumpset") && argc > 4) {
+        static pmpro_dump d; char e[128];
+        if (!pmpro_dump_load(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
+        int idx = atoi(argv[3]);
+        if (!pmpro_dump_set_block(&d, idx, argv[4])) { printf("set failed (bad index %d or hex)\n", idx); return 2; }
+        if (!pmpro_dump_save(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
+        printf("block %d set; saved %s\n", idx, argv[2]);
+        return 0;
+    }
+
     pmpro_dev dev;
     if (!pmpro_open(&dev, NULL)) { printf("open: %s\n", dev.err); return 1; }
 

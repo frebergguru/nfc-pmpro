@@ -62,7 +62,7 @@ target_link_libraries(pmpro PRIVATE ${ADW_LIBRARIES} hardnested)
 target_compile_options(pmpro PRIVATE ${ADW_CFLAGS_OTHER})
 
 # CLI tools (no GTK) — protocol control + RE probe
-add_executable(pmctl src/pmctl.c src/hidraw.c src/furui.c src/session.c src/protocol.c src/crypto1.c src/crack.c src/hardnested_glue.c src/nested.c)
+add_executable(pmctl src/pmctl.c src/hidraw.c src/furui.c src/session.c src/protocol.c src/crypto1.c src/crack.c src/hardnested_glue.c src/nested.c src/dump.c)
 target_link_libraries(pmctl PRIVATE hardnested)
 add_executable(pmprobe src/probe.c src/hidraw.c src/protocol.c)
 

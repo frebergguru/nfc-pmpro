@@ -46,6 +46,8 @@ typedef struct {
     GtkWidget *ws_key;      /* write-sector: key A */
     GtkWidget *ws_data;     /* write-sector: data hex */
     GtkWidget *clone_key;   /* clone: destination key A */
+    GtkWidget *edit_block;  /* edit buffer: block index */
+    GtkWidget *edit_hex;    /* edit buffer: new block hex */
     AdwToastOverlay *toasts;
 
     pmpro_dump last;       /* last successful read, for Save */
@@ -366,6 +368,64 @@ static gpointer w_write_buffer(gpointer p)
         }
     }
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
+}
+
+/* ---- edit the buffer in place + diff against a file (main thread) ------- */
+
+static void on_set_block(GtkButton *b, gpointer u)
+{
+    (void)b;
+    App *a = u;
+    if (!a->have_last || a->last.n_blocks == 0) {
+        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Buffer empty — read or load a card first"));
+        return;
+    }
+    int idx = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->edit_block));
+    const char *hex = gtk_editable_get_text(GTK_EDITABLE(a->edit_hex));
+    if (pmpro_dump_set_block(&a->last, idx, hex)) {
+        post(a, K_READ, 1, "Edited block %d -> %s", idx, a->last.blocks[idx]);
+        post(a, K_TOAST, 1, "Block %d updated in buffer", idx);
+    } else {
+        post(a, K_TOAST, 0, "Edit failed: index 0..%d, valid hex (≤64 bytes)",
+             a->last.n_blocks - 1);
+    }
+}
+
+static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    pmpro_dump *other = g_new0(pmpro_dump, 1);
+    char err[128];
+    if (pmpro_dump_load(other, path, err, sizeof err)) {
+        char *buf = g_malloc(16384);
+        int n = pmpro_dump_diff(&a->last, other, buf, 16384);
+        post(a, K_READ, n == 0, "Diff: buffer vs %s — %d difference(s)", path, n);
+        char **lines = g_strsplit(buf, "\n", -1);
+        for (char **p = lines; *p; p++)
+            if (**p) post(a, K_READ, 1, "  %s", *p);
+        g_strfreev(lines);
+        g_free(buf);
+    } else {
+        post(a, K_TOAST, 0, "%s", err);
+    }
+    g_free(other);
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_diff(GtkButton *b, gpointer u)
+{
+    (void)b;
+    App *a = u;
+    if (!a->have_last) {
+        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Buffer empty — read or load a card first"));
+        return;
+    }
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_open(d, a->win, NULL, on_diff_finish, a);
 }
 
 typedef struct { App *a; uint8_t block; uint8_t type; int mode; } CrackJob; /* mode 0=dict,1=darkside,2=hardnested */
@@ -920,6 +980,31 @@ static GtkWidget *page_write(App *a)
     gtk_box_append(GTK_BOX(r3), a->clone_key);
     gtk_box_append(GTK_BOX(r3), clbtn);
     gtk_box_append(GTK_BOX(box), r3);
+
+    /* ---- Edit / Diff the buffer ---- */
+    gtk_box_append(GTK_BOX(box), section_label("Edit / compare buffer"));
+    GtkWidget *ehint = gtk_label_new(
+        "Edit a block of the read/loaded buffer, or diff the buffer against a "
+        ".pmdump file. Results print on the Read tab.");
+    gtk_label_set_xalign(GTK_LABEL(ehint), 0);
+    gtk_label_set_wrap(GTK_LABEL(ehint), TRUE);
+    gtk_widget_add_css_class(ehint, "dim-label");
+    gtk_box_append(GTK_BOX(box), ehint);
+    GtkWidget *r5 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(r5), gtk_label_new("Block"));
+    a->edit_block = gtk_spin_button_new_with_range(0, PMPRO_MAX_BLOCKS - 1, 1);
+    a->edit_hex = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(a->edit_hex), "new block hex (≤64 bytes)");
+    gtk_widget_set_hexpand(a->edit_hex, TRUE);
+    GtkWidget *setbtn = gtk_button_new_with_label("Set block");
+    g_signal_connect(setbtn, "clicked", G_CALLBACK(on_set_block), a);
+    GtkWidget *diffbtn = gtk_button_new_with_label("Diff vs file…");
+    g_signal_connect(diffbtn, "clicked", G_CALLBACK(on_diff), a);
+    gtk_box_append(GTK_BOX(r5), a->edit_block);
+    gtk_box_append(GTK_BOX(r5), a->edit_hex);
+    gtk_box_append(GTK_BOX(r5), setbtn);
+    gtk_box_append(GTK_BOX(r5), diffbtn);
+    gtk_box_append(GTK_BOX(box), r5);
 
     /* ---- LF: write a 125 kHz ID card ---- */
     gtk_box_append(GTK_BOX(box), section_label("Write 125 kHz ID card (T5577/EM4305)"));

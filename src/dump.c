@@ -1,4 +1,5 @@
 #include "dump.h"
+#include "protocol.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,44 @@ bool pmpro_dump_add_key(pmpro_dump *d, const char *hex)
     snprintf(d->keys[d->n_keys], PMPRO_LINE, "%s", hex);
     d->n_keys++;
     return true;
+}
+
+bool pmpro_dump_set_block(pmpro_dump *d, int idx, const char *hex)
+{
+    if (idx < 0 || idx >= d->n_blocks)
+        return false;
+    unsigned char tmp[64];
+    int nb = pmpro_parse_hex(hex, tmp, sizeof tmp);
+    if (nb <= 0)
+        return false;
+    char norm[PMPRO_LINE];
+    pmpro_hex(tmp, (size_t)nb, norm, sizeof norm);
+    snprintf(d->blocks[idx], PMPRO_LINE, "%s", norm);
+    return true;
+}
+
+int pmpro_dump_diff(const pmpro_dump *a, const pmpro_dump *b, char *out, size_t cap)
+{
+    size_t pos = 0;
+    int diffs = 0;
+    if (cap) out[0] = '\0';
+    #define APP(...) do { if (pos < cap) pos += (size_t)snprintf(out + pos, cap - pos, __VA_ARGS__); } while (0)
+    if (strcmp(a->card_type, b->card_type)) { APP("type:  %s | %s\n", a->card_type, b->card_type); diffs++; }
+    if (strcmp(a->frequency, b->frequency)) { APP("freq:  %s | %s\n", a->frequency, b->frequency); diffs++; }
+    if (strcmp(a->uid, b->uid))             { APP("uid:   %s | %s\n", a->uid, b->uid); diffs++; }
+    int n = a->n_blocks > b->n_blocks ? a->n_blocks : b->n_blocks;
+    for (int i = 0; i < n; i++) {
+        const char *ba = i < a->n_blocks ? a->blocks[i] : "(none)";
+        const char *bb = i < b->n_blocks ? b->blocks[i] : "(none)";
+        if (strcmp(ba, bb)) {
+            diffs++;
+            APP("block %d:\n  A: %s\n  B: %s\n", i, ba, bb);
+        }
+    }
+    if (diffs == 0)
+        APP("identical (%d blocks, uid %s)\n", a->n_blocks, a->uid);
+    #undef APP
+    return diffs;
 }
 
 bool pmpro_dump_save(const pmpro_dump *d, const char *path, char *err, size_t n)
