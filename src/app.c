@@ -28,10 +28,13 @@ typedef struct {
     gboolean connected;    /* handshake done */
     gboolean busy;
     gboolean mute;         /* suppress confirmation beeps */
+    gboolean loading;      /* set while restoring settings (suppresses save) */
     GMutex lock;
 
     GtkWidget *status_pill;
     GtkWidget *info_label;
+    GtkWidget *mute_check;     /* the "Mute beeps" toggle (for restore) */
+    GPtrArray *key_files;      /* paths of imported .keys files (persisted) */
     GtkTextBuffer *read_buf;
     GtkWidget *read_view;
     GtkWidget *key_entry;
@@ -449,7 +452,13 @@ static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
 
 static void on_connect(GtkButton *b, gpointer u) { (void)b; start_op(u, w_connect, NULL); }
 static void on_beep(GtkButton *b, gpointer u)    { (void)b; start_op(u, w_beep, NULL); }
-static void on_mute(GtkCheckButton *b, gpointer u) { ((App *)u)->mute = gtk_check_button_get_active(b); }
+static void settings_save(App *a);   /* fwd: defined with the settings code */
+static void on_mute(GtkCheckButton *b, gpointer u)
+{
+    App *a = u;
+    a->mute = gtk_check_button_get_active(b);
+    settings_save(a);
+}
 static void on_read_hf(GtkButton *b, gpointer u)
 {
     (void)b;
@@ -598,6 +607,10 @@ static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
     char err[128];
     int n = furui_keys_load(path, err, sizeof err);
     if (n >= 0) {
+        if (!a->key_files)
+            a->key_files = g_ptr_array_new_with_free_func(g_free);
+        g_ptr_array_add(a->key_files, g_strdup(path));
+        settings_save(a);     /* remember the file so it reloads next launch */
         post(a, K_CRACK, 1, "Loaded %d key(s) from %s — %d in dictionary now",
              n, path, furui_keys_count());
         post(a, K_TOAST, 1, "Loaded %d keys (%d total)", n, furui_keys_count());
@@ -666,6 +679,96 @@ static void on_autopwn(GtkButton *b, gpointer u)
     gtk_file_dialog_save(d, a->win, NULL, on_autopwn_save_finish, a);
 }
 
+/* ---- persistent settings (~/.config/pmpro/settings.ini) ---------------- */
+
+static char *settings_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "pmpro", "settings.ini", NULL);
+}
+
+static void settings_save(App *a)
+{
+    if (a->loading)
+        return;
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_set_boolean(kf, "ui", "mute", a->mute);
+    if (a->key_entry) {
+        const char *k = gtk_editable_get_text(GTK_EDITABLE(a->key_entry));
+        g_key_file_set_string(kf, "ui", "key", k ? k : "");
+    }
+    if (a->win) {
+        int w = 0, h = 0;
+        gtk_window_get_default_size(a->win, &w, &h);
+        if (w > 0 && h > 0) {
+            g_key_file_set_integer(kf, "ui", "width", w);
+            g_key_file_set_integer(kf, "ui", "height", h);
+        }
+    }
+    if (a->key_files && a->key_files->len) {
+        GString *s = g_string_new(NULL);
+        for (guint i = 0; i < a->key_files->len; i++) {
+            if (i) g_string_append_c(s, ';');
+            g_string_append(s, g_ptr_array_index(a->key_files, i));
+        }
+        g_key_file_set_string(kf, "keys", "files", s->str);
+        g_string_free(s, TRUE);
+    }
+    char *path = settings_path();
+    char *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_key_file_save_to_file(kf, path, NULL);
+    g_free(dir);
+    g_free(path);
+    g_key_file_free(kf);
+}
+
+static void settings_load(App *a)
+{
+    char *path = settings_path();
+    GKeyFile *kf = g_key_file_new();
+    a->loading = TRUE;
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        if (g_key_file_has_key(kf, "ui", "mute", NULL)) {
+            a->mute = g_key_file_get_boolean(kf, "ui", "mute", NULL);
+            if (a->mute_check)
+                gtk_check_button_set_active(GTK_CHECK_BUTTON(a->mute_check), a->mute);
+        }
+        char *k = g_key_file_get_string(kf, "ui", "key", NULL);
+        if (k) {
+            if (a->key_entry && *k) gtk_editable_set_text(GTK_EDITABLE(a->key_entry), k);
+            g_free(k);
+        }
+        int w = g_key_file_get_integer(kf, "ui", "width", NULL);
+        int h = g_key_file_get_integer(kf, "ui", "height", NULL);
+        if (w > 0 && h > 0 && a->win)
+            gtk_window_set_default_size(a->win, w, h);
+        char *files = g_key_file_get_string(kf, "keys", "files", NULL);
+        if (files) {
+            char **parts = g_strsplit(files, ";", -1);
+            int total = 0;
+            for (char **p = parts; *p; p++) {
+                if (**p == '\0') continue;
+                char err[128];
+                int n = furui_keys_load(*p, err, sizeof err);
+                if (n >= 0) {
+                    total += n;
+                    if (!a->key_files)
+                        a->key_files = g_ptr_array_new_with_free_func(g_free);
+                    g_ptr_array_add(a->key_files, g_strdup(*p));
+                }
+            }
+            g_strfreev(parts);
+            g_free(files);
+            if (total)
+                post(a, K_CRACK, 1, "Restored %d key(s) from saved .keys files "
+                     "(%d in dictionary)", total, furui_keys_count());
+        }
+    }
+    a->loading = FALSE;
+    g_key_file_free(kf);
+    g_free(path);
+}
+
 /* ---- UI construction --------------------------------------------------- */
 
 static GtkWidget *mono_view(GtkTextBuffer **buf)
@@ -705,6 +808,7 @@ static GtkWidget *page_device(App *a)
     GtkWidget *beep = gtk_button_new_with_label("Beep");
     g_signal_connect(beep, "clicked", G_CALLBACK(on_beep), a);
     GtkWidget *mute = gtk_check_button_new_with_label("Mute beeps");
+    a->mute_check = mute;
     gtk_widget_set_tooltip_text(mute, "Suppress the confirmation beep after "
                                 "connect/read/write/crack (the Beep button still works)");
     g_signal_connect(mute, "toggled", G_CALLBACK(on_mute), a);
@@ -932,6 +1036,14 @@ static void load_css(void)
     g_object_unref(p);
 }
 
+/* persist size + current key entry on close */
+static gboolean on_close_request(GtkWindow *w, gpointer u)
+{
+    (void)w;
+    settings_save((App *)u);
+    return FALSE;   /* allow the close to proceed */
+}
+
 static void activate(GtkApplication *gapp, gpointer user)
 {
     App *a = user;
@@ -970,6 +1082,9 @@ static void activate(GtkApplication *gapp, gpointer user)
     adw_toast_overlay_set_child(a->toasts, stack);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), GTK_WIDGET(a->toasts));
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(win), toolbar);
+
+    settings_load(a);   /* restore mute / key / window size / .keys files */
+    g_signal_connect(win, "close-request", G_CALLBACK(on_close_request), a);
     gtk_window_present(GTK_WINDOW(win));
 }
 
