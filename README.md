@@ -23,11 +23,10 @@ software, no Wine needed at runtime.
   type, one block per line, colour-coded), and a byte-level **Diff Tool** window
   (per-byte highlighting, % difference, hide-identical), à la MifareClassicTool.
   Offline: `pmctl dumpset <file> <blk> <hex>` / `dumpdiff <a> <b>` / `dumpconv <in> <out>`.
-- **Import / export `.keys`** — Dump tab (or Crack tab): import a `.keys`
-  dictionary, or save a dump's recovered Key A/Key B values to a `.keys` file.
-- **Import .keys** — load MifareClassicTool-style `.keys` dictionaries (GUI
-  Crack tab "Load keys…", or `pmctl dict <blk> <type> <file>`); the keys extend
-  the dictionary used by Dictionary/Nested/Autopwn.
+- **Import / export `.keys`** — import MifareClassicTool-style `.keys`
+  dictionaries (GUI Crack/Dump tab, or `pmctl dict <blk> <type> <file>`) to
+  extend the dictionary used by Read / Dictionary / Nested / Autopwn / tag ops;
+  or export a dump's recovered Key A/Key B values to a `.keys` file.
 - **Crack** — four Mifare key attacks, plus whole-card autopwn:
   - **Dictionary** (cmd 13) — tries common/default keys; returns the one that
     authenticates. *(verified live)*
@@ -47,17 +46,20 @@ software, no Wine needed at runtime.
     sectors keyed and read)*
 - **Format** a sector, **beep** (with a mute toggle), **find/scan** (openfind),
   raw **console** (send a payload; see the decrypted reply).
-- **Tag operations** — Copy, Erase, Format memory, Set/Remove password (sector
-  keys) on Mifare Classic; Copy/Erase on LF EM4100. (Lock is intentionally not
-  implemented yet — it is irreversible.)
+- **Tag operations** (Mifare Classic) — Copy, Erase, Format memory, Set/Remove
+  password. Each finds a per-sector key (box key → dictionary → nested), writes
+  the trailer with Key B when it's required (recovering it automatically), resets
+  sector 0 via the device's `cmd 16` format (its block 0 is read-only), and
+  **verifies every write by reading the sector back** — it won't claim a change it
+  can't prove. Plus Copy/Erase for LF EM4100. (Lock is deferred — it is irreversible.)
 - **Card insight** — card-type detection (SAK/ATQA), decoded access conditions
   and value blocks (shown inline), and a per-sector **Key map** grid.
 - **Auto-read** — optionally poll and read a card automatically when placed.
 - **Write confirmations** — destructive writes ask before touching a card.
 
-The GUI is organised into tabs — **Device · HF · Mifare · LF · HID · Crack ·
-Dump · Console** — each with its own log so an action's output appears next to
-it. Preferences (mute, default key, window size, imported `.keys`) persist in
+The GUI has six tabs — **Device**, **HF · Mifare**, **LF · HID**, **Crack**,
+**Dump**, **Console** — each with its own log so an action's output appears next
+to it. Preferences (mute, default key, window size, imported `.keys`) persist in
 `~/.config/pmpro/settings.ini`.
 
 The protocol (RC4 + CRC-16/CCITT + framing, full command table) is documented in
@@ -93,10 +95,12 @@ sudo cp tools/99-pmpro.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 - `src/furui.[ch]` — RC4 cipher, CRC16, packet framing.
 - `src/session.[ch]` — connect handshake, command exec (multi-report send/recv + decrypt).
 - `src/hidraw.[ch]` — dependency-free hidraw transport (auto-discovers the device).
-- `src/app.c` — GTK4/libadwaita GUI.
-- `src/pmctl.c` — CLI. `src/probe.c` — low-level RE probe.
-- `tools/` — `extract_costura.py` (pull DLLs from the .NET exe), `parse_usbmon.py`,
-  Ghidra decompile script.
+- `src/protocol.[ch]` — hex/parse, card-type, value-block & access-condition decode.
+- `src/crack.c`, `nested.c`, `crypto1.c`, `hardnested_glue.c`, `hardnested/` — key recovery.
+- `src/dump.[ch]` — `.pmdump` / `.mfd` / `.keys` load · save · diff.
+- `src/app.c` — GTK4/libadwaita GUI. `src/pmctl.c` — CLI. `src/probe.c` — RE probe.
+- `tests/` — Crypto-1 + dump/protocol self-tests (`ctest`).
+- `data/` — `.desktop` launcher + icon. `tools/99-pmpro.rules` — udev rule.
 
 ## Responsible use
 This device and app read/write/clone RFID/NFC cards and include Mifare key-recovery.

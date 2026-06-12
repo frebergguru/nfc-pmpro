@@ -48,12 +48,14 @@ Payloads below are the plaintext **before** framing+encryption.
 | `2E` | write HID prox       | `2E <CardID×12>`                                 | |
 | `10` | activate HF card     | `10`                                             | precedes sector ops |
 | `13` | check keys (auth)    | `13 <block> <type> <count> <key×6…>`             | tries the key list; resp payload = the key that authenticated (dictionary attack + verifier) |
+| `14` | nested collect       | `14 <fBlock> <fType> <fKey×6> <tBlock> <tType> <DevRandom×4>` (after cmd `10`) | foothold→target nonces: header(uid…) + 15 foothold pairs + 8 target `nt(4) NtEnc(4) par(3)` records. Nonces **little-endian**; the cipher authuid is **big-endian**. Intermittent — retry |
 | `15` | darkside collect     | `15 <attBlock> <attType>`                        | resp payload = uid + nonce records (3 bytes only on hardened cards) |
-| `16` | format sector        | `16 <sector> <flag> <keyA×6> <keyB×6>`           | flag 1=A,2=B,3=both |
-| `17` | read sector          | `17 <sector> <flag> <keyA×6> <keyB×6>`           | resp = `[len][01][status][pad][64 sector bytes]`; **status `0f`=auth OK, `00`=auth fail** |
-| `18` | write sector         | `18 <sector> <flag> <keyA×6> <keyB×6> <data×64>` | full 64-byte sector (3 blocks + trailer) |
+| `16` | format sector        | `16 <sector> <flag> <keyA×6> <keyB×6>`           | flag 1=A,2=B,3=both. Resets the sector (zeros data, keys→default `FF`). **Works on sector 0** — the firmware skips the read-only block 0, so this is the only way to reset sector 0's trailer |
+| `17` | read sector          | `17 <sector> <flag> <keyA×6> <keyB×6>`           | resp = `[len][01][status][pad][256 sector bytes]`; **status `0f`=auth OK, `00`=auth fail**. Device returns a fixed 256-byte payload (1K sector = first 64 real + zero pad) |
+| `18` | write sector         | `18 <sector> <flag> <keyA×6> <keyB×6> <data×64>` | full 64-byte sector (3 blocks + trailer). **The device ACKs even when the card rejects a block** — verify by read-back. A trailer write needs a key with write rights (often Key B); a whole-sector write to **sector 0 is rejected** (block 0 read-only) — use cmd `16` |
 | `1D` | read blank block     | `1D <block>`                                     | magic/gen1a backdoor read (no auth) |
 | `1E`/`1F` | write IC / finalize | `1E <cardType> <cardData…>` then `1F …`     | whole-card (magic) write |
+| `30` | hardnested collect   | `30 <ckBlock><ckType><ckKey×6><atBlock><atType><atCount><isFirst><DevRandom×4>` | encrypted-nonce stream feeding the hardnested solver |
 | `26` | init detect (config) | `26 <Config> <CardID×4> <CardXOR> <ASK> <CardType×2> <CardRandom×4>` | |
 | `27` | get detect data      | `27`                                             | resp: [3:5]=count, then `count`×18-byte records |
 
@@ -71,6 +73,11 @@ via cmd 13. Dual-use; only for cards you own / are authorized to test.
 
 ## Verified live
 `connect` (06+01+06), `beep` (09), `openfind` (0F), HF read (21 → real UID
-`fb be 05 9f …`), LF read (28), Mifare read/write/clone (17/18, round-trip + clone
-match), dictionary attack (13 → recovered `FF…`), darkside collect (15 → "hardened"
-on a locked card). Implemented across `src/{furui,session,crack,crypto1}.c`.
+`fb be 05 9f …`), LF read/write (28/2D), HID read/write (29/2E), Mifare
+read/write/clone (17/18, round-trip + clone match), dictionary attack (13 →
+recovered `FF…`), **nested** (14 → cracked a real fob's unknown sector keys, Key A
+*and* Key B), darkside collect (15 → "hardened" on a locked card), **format/tag
+ops** (16/18 → erase, factory-reset keys→`FF`, set/remove password; trailer writes
+fall back to a dict/nested Key B and are confirmed by read-back; sector 0 reset via
+cmd `16`). Implemented across `src/{furui,session,crack,nested,crypto1,dump}.c`
+and driven from `src/app.c` / `src/pmctl.c`.
