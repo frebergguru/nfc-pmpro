@@ -711,8 +711,17 @@ static int hf_verify(App *a, int s, const uint8_t out[64])
     return 1;
 }
 
-/* write out[64] to sector s, verifying by read-back; if the read key couldn't
- * change the trailer, retry with a dictionary Key B. TW_OK / TW_DENIED / TW_NOKEY. */
+/* try writing out[64] to sector s with Key B `kb`, verify by read-back */
+static int hf_try_keyb(App *a, int s, const uint8_t out[64], const uint8_t kb[6])
+{
+    furui_activate(&a->dev);
+    furui_write_sector(&a->dev, (uint8_t)s, 2, NULL, kb, out, 64);
+    return hf_verify(a, s, out);
+}
+
+/* write out[64] to sector s, verifying by read-back. If the read key can't
+ * change the trailer, try a dictionary Key B, then recover Key B via the
+ * nested attack and retry. TW_OK / TW_DENIED / TW_NOKEY. */
 enum { TW_OK, TW_DENIED, TW_NOKEY };
 static int hf_write(App *a, int s, const uint8_t out[64])
 {
@@ -722,11 +731,17 @@ static int hf_write(App *a, int s, const uint8_t out[64])
     furui_write_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
                        type ? NULL : key, type ? key : NULL, out, 64);
     if (hf_verify(a, s, out)) return TW_OK;
+
     uint8_t kb[6];               /* the write didn't take — the trailer needs Key B */
-    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, kb)) {
-        furui_activate(&a->dev);
-        furui_write_sector(&a->dev, (uint8_t)s, 2, NULL, kb, out, 64);
-        if (hf_verify(a, s, out)) return TW_OK;
+    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, kb) && hf_try_keyb(a, s, out, kb))
+        return TW_OK;
+
+    /* last resort: recover Key B with the nested attack, then retry */
+    char log[256];
+    post(a, K_HF, 1, "  sector %d: recovering Key B via nested (slow)…", s);
+    if (furui_nested_auto(&a->dev, (uint8_t)(s * 4), 1, kb, log, sizeof log)) {
+        furui_keys_add(kb);
+        if (hf_try_keyb(a, s, out, kb)) return TW_OK;
     }
     return TW_DENIED;
 }
@@ -734,7 +749,7 @@ static int hf_write(App *a, int s, const uint8_t out[64])
 static void tw_report(App *a, int s, int r, const char *okmsg)
 {
     if (r == TW_OK)          post(a, K_HF, 1, "  sector %d %s", s, okmsg);
-    else if (r == TW_DENIED) post(a, K_HF, 0, "  sector %d: trailer write denied — needs Key B (recover via Crack → Nested)", s);
+    else if (r == TW_DENIED) post(a, K_HF, 0, "  sector %d: trailer write denied — Key B not recoverable (hardened sector)", s);
     else                     post(a, K_HF, 0, "  sector %d: no key found", s);
 }
 
