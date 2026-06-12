@@ -17,8 +17,8 @@ software, no Wine needed at runtime.
   the buffer to write to a blank. Load auto-detects raw binary `.mfd` dumps
   (e.g. autopwn output, or libnfc/Proxmark dumps) as well as `.pmdump`.
 - **Edit / diff dumps** — edit a block of the buffer and diff it against another
-  `.pmdump` (GUI Write tab, or `pmctl dumpset <file> <blk> <hex>` /
-  `pmctl dumpdiff <a> <b>` offline).
+  dump (GUI Dump tab, or `pmctl dumpset <file> <blk> <hex>` /
+  `pmctl dumpdiff <a> <b>` / `pmctl dumpconv <in> <out>` offline).
 - **Import .keys** — load MifareClassicTool-style `.keys` dictionaries (GUI
   Crack tab "Load keys…", or `pmctl dict <blk> <type> <file>`); the keys extend
   the dictionary used by Dictionary/Nested/Autopwn.
@@ -39,8 +39,13 @@ software, no Wine needed at runtime.
     whole card and writes a raw **`.mfd`** dump (recovered keys in the trailers),
     loadable by standard Mifare tools. *(verified: full 1K fob dumped, 16/16
     sectors keyed and read)*
-- **Format** a sector, **beep** (with a mute toggle), **LED/openfind**, **save
-  dumps**, raw **console** (send a payload; see the decrypted reply).
+- **Format** a sector, **beep** (with a mute toggle), **find/scan** (openfind),
+  raw **console** (send a payload; see the decrypted reply).
+
+The GUI is organised into tabs — **Device · HF · Mifare · LF · HID · Crack ·
+Dump · Console** — each with its own log so an action's output appears next to
+it. Preferences (mute, default key, window size, imported `.keys`) persist in
+`~/.config/pmpro/settings.ini`.
 
 The protocol (RC4 + CRC-16/CCITT + framing, full command table) is documented in
 [PROTOCOL.md](PROTOCOL.md). It was recovered from the official `PM_Pro.exe`

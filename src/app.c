@@ -3,6 +3,9 @@
  * Speaks the reverse-engineered FURUI "talk" protocol (RC4 + CRC16 + framing,
  * see PROTOCOL.md / furui.c / session.c) over raw hidraw. Device operations run
  * on a background thread and post results back to the UI via g_idle_add.
+ *
+ * Tabs: Device · HF (Mifare) · LF / HID · Crack · Dump · Console. Each tab has
+ * its own log view so an action's output appears where the action lives.
  */
 #include <adwaita.h>
 #include <gtk/gtk.h>
@@ -35,34 +38,42 @@ typedef struct {
     GtkWidget *info_label;
     GtkWidget *mute_check;     /* the "Mute beeps" toggle (for restore) */
     GPtrArray *key_files;      /* paths of imported .keys files (persisted) */
-    GtkTextBuffer *read_buf;
-    GtkWidget *read_view;
-    GtkWidget *key_entry;
-    GtkTextBuffer *console_buf;
-    GtkWidget *console_view;
+
+    /* HF (Mifare) tab */
+    GtkWidget *key_entry;      /* read key A */
+    GtkWidget *ws_sector, *ws_key, *ws_data;   /* write sector */
+    GtkWidget *fmt_sector, *fmt_key;           /* format sector */
+    GtkWidget *clone_key;                       /* clone destination key A */
+    GtkTextBuffer *hf_buf; GtkWidget *hf_view;
+
+    /* LF / HID tab */
+    GtkWidget *lf_entry;       /* LF write fields */
+    GtkWidget *hid_entry;      /* HID write 12-byte card id */
+    GtkTextBuffer *lfhid_buf; GtkWidget *lfhid_view;
+
+    /* Crack tab */
+    GtkWidget *crack_block, *crack_typeB;
+    GtkTextBuffer *crack_buf; GtkWidget *crack_view;
+    char mfd_path[512];
+
+    /* Dump tab */
+    GtkWidget *edit_block, *edit_hex;
+    GtkTextBuffer *dump_buf; GtkWidget *dump_view;
+
+    /* Console tab */
     GtkWidget *hex_entry;
-    GtkWidget *wr_entry;
-    GtkWidget *ws_sector;   /* write-sector: sector number */
-    GtkWidget *ws_key;      /* write-sector: key A */
-    GtkWidget *ws_data;     /* write-sector: data hex */
-    GtkWidget *clone_key;   /* clone: destination key A */
-    GtkWidget *edit_block;  /* edit buffer: block index */
-    GtkWidget *edit_hex;    /* edit buffer: new block hex */
+    GtkTextBuffer *console_buf; GtkWidget *console_view;
+
     AdwToastOverlay *toasts;
 
-    pmpro_dump last;       /* last successful read, for Save */
+    pmpro_dump last;       /* read/loaded card buffer */
     gboolean have_last;
-    uint8_t cur_key[6];    /* key to use for the next sector read (main->worker) */
-    GtkWidget *crack_block;
-    GtkWidget *crack_typeB;
-    GtkTextBuffer *crack_buf;
-    GtkWidget *crack_view;
-    char mfd_path[512];
+    uint8_t cur_key[6];    /* key for the next sector read (main->worker) */
 } App;
 
 /* ---- UI marshalling (worker thread -> main loop) ----------------------- */
 
-enum { K_STATUS, K_TOAST, K_CONSOLE, K_READ, K_INFO, K_CRACK };
+enum { K_STATUS, K_TOAST, K_INFO, K_HF, K_LFHID, K_CRACK, K_DUMP, K_CONSOLE };
 
 typedef struct { App *a; int kind; int ok; char text[1024]; } UiMsg;
 
@@ -71,6 +82,7 @@ static void append_view(GtkTextBuffer *buf, GtkWidget *view, const char *t)
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(buf, &end);
     gtk_text_buffer_insert(buf, &end, t, -1);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
     GtkTextMark *m = gtk_text_buffer_get_insert(buf);
     gtk_text_buffer_get_end_iter(buf, &end);
     gtk_text_buffer_move_mark(buf, m, &end);
@@ -91,15 +103,14 @@ static gboolean ui_apply(gpointer p)
     UiMsg *m = p;
     App *a = m->a;
     switch (m->kind) {
-    case K_STATUS: set_status(a, m->ok, m->text); break;
-    case K_TOAST:  adw_toast_overlay_add_toast(a->toasts, adw_toast_new(m->text)); break;
-    case K_INFO:   gtk_label_set_text(GTK_LABEL(a->info_label), m->text); break;
-    case K_CONSOLE: append_view(a->console_buf, a->console_view, m->text);
-                    append_view(a->console_buf, a->console_view, "\n"); break;
-    case K_READ:   append_view(a->read_buf, a->read_view, m->text);
-                   append_view(a->read_buf, a->read_view, "\n"); break;
-    case K_CRACK:  append_view(a->crack_buf, a->crack_view, m->text);
-                   append_view(a->crack_buf, a->crack_view, "\n"); break;
+    case K_STATUS:  set_status(a, m->ok, m->text); break;
+    case K_TOAST:   adw_toast_overlay_add_toast(a->toasts, adw_toast_new(m->text)); break;
+    case K_INFO:    gtk_label_set_text(GTK_LABEL(a->info_label), m->text); break;
+    case K_HF:      append_view(a->hf_buf, a->hf_view, m->text); break;
+    case K_LFHID:   append_view(a->lfhid_buf, a->lfhid_view, m->text); break;
+    case K_CRACK:   append_view(a->crack_buf, a->crack_view, m->text); break;
+    case K_DUMP:    append_view(a->dump_buf, a->dump_view, m->text); break;
+    case K_CONSOLE: append_view(a->console_buf, a->console_view, m->text); break;
     }
     g_free(m);
     return G_SOURCE_REMOVE;
@@ -115,23 +126,32 @@ static void post(App *a, int kind, int ok, const char *fmt, ...)
     g_idle_add(ui_apply, m);
 }
 
-/* ---- device helpers (run on worker thread, hold a->lock) --------------- */
-
-static gboolean ensure_open(App *a)
+static void toast(App *a, const char *t)
 {
-    if (a->opened)
-        return TRUE;
-    if (pmpro_open(&a->dev, NULL)) {
-        a->opened = TRUE;
-        return TRUE;
-    }
-    post(a, K_STATUS, 0, "No device");
-    post(a, K_TOAST, 0, "%s", a->dev.err);
-    return FALSE;
+    adw_toast_overlay_add_toast(a->toasts, adw_toast_new(t));
 }
 
-/* Rotating buffers so several hex_str() results can be live in one expression
- * (e.g. two %s args) without clobbering each other. Worker-thread only. */
+/* ---- device helpers (run on worker thread, hold a->lock) --------------- */
+
+static gboolean ensure_ready(App *a)
+{
+    if (!a->opened) {
+        if (!pmpro_open(&a->dev, NULL)) {
+            post(a, K_STATUS, 0, "No device");
+            post(a, K_TOAST, 0, "%s", a->dev.err);
+            return FALSE;
+        }
+        a->opened = TRUE;
+    }
+    if (!a->connected) {
+        a->connected = furui_connect(&a->dev);
+        if (a->connected)
+            post(a, K_STATUS, 1, "Connected — %s", a->dev.path);
+    }
+    return TRUE;
+}
+
+/* Rotating buffers so several hex_str() results can be live in one expression. */
 static char *hex_str(const uint8_t *d, size_t n)
 {
     static char bufs[4][256];
@@ -154,10 +174,8 @@ static gpointer w_connect(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         if (a->connected) {
-            post(a, K_STATUS, 1, "Connected — %s", a->dev.path);
             post(a, K_INFO, 1, "FR-RATEL connected on %s. Handshake OK (RC4/CRC16).",
                  a->dev.path);
             post(a, K_TOAST, 1, "Connected");
@@ -176,10 +194,22 @@ static gpointer w_beep(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         int ok = furui_beep(&a->dev, 0x01, 0x02);
         post(a, K_TOAST, ok, ok ? "Beep" : "Beep failed");
+    }
+    g_atomic_int_set(&a->busy, FALSE);
+    g_mutex_unlock(&a->lock);
+    return NULL;
+}
+
+static gpointer w_openfind(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        int ok = furui_openfind(&a->dev);
+        post(a, K_TOAST, ok, ok ? "Scan indicator on" : "Find failed");
     }
     g_atomic_int_set(&a->busy, FALSE);
     g_mutex_unlock(&a->lock);
@@ -190,21 +220,19 @@ static gpointer w_read_hf(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         furui_hf_card c;
         if (furui_read_hf(&a->dev, &c)) {
             uid_info ui; pmpro_decode_uid(c.uid, c.uid_len, &ui);
             char tail[32];
             pmpro_hex(c.tail, c.tail_len, tail, sizeof tail);
-            post(a, K_READ, 1, "HF (13.56MHz)  UID: %s (%d-byte)   [ATQA/SAK: %s]",
+            post(a, K_HF, 1, "HF (13.56 MHz)  UID: %s (%d-byte)   [ATQA/SAK: %s]",
                  ui.uid, ui.uid_len, tail);
             pmpro_dump_init(&a->last);
             snprintf(a->last.card_type, sizeof a->last.card_type, "ISO14443A");
             snprintf(a->last.frequency, sizeof a->last.frequency, "13.56MHz");
             snprintf(a->last.uid, sizeof a->last.uid, "%s", ui.uid);
             a->have_last = TRUE;
-            /* sector sweep with the chosen key (default FF) */
             char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
             int open_sectors = 0;
             for (int s = 0; s < 16; s++) {
@@ -212,23 +240,23 @@ static gpointer w_read_hf(gpointer p)
                 uint8_t blk[64];
                 size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL,
                                               blk, sizeof blk);
-                if (bl >= 64) {        /* auth succeeded -> real 64-byte sector */
+                if (bl >= 64) {
                     open_sectors++;
                     char h[200]; pmpro_hex(blk, 64, h, sizeof h);
-                    post(a, K_READ, 1, "  sector %2d (key %s): %s", s, kh, h);
+                    post(a, K_HF, 1, "  sector %2d (key %s): %s", s, kh, h);
                     pmpro_dump_add_block(&a->last, h);
                 }
             }
             if (!open_sectors)
-                post(a, K_READ, 0, "  no sectors readable with key %s "
-                     "(card uses other keys — try a known key, or it's hardened)", kh);
+                post(a, K_HF, 0, "  no sectors readable with key %s "
+                     "(use Crack to recover keys, or it's hardened)", kh);
             else
-                post(a, K_READ, 1, "  %d/16 sectors read into buffer (use Write/Clone "
-                     "to write them to a blank)", open_sectors);
+                post(a, K_HF, 1, "  %d/16 sectors → buffer (Clone below, or the Dump tab)",
+                     open_sectors);
             post(a, K_TOAST, 1, "HF card read");
             app_beep(a);
         } else {
-            post(a, K_READ, 0, "HF: no card on reader");
+            post(a, K_HF, 0, "HF: no card on reader");
             post(a, K_TOAST, 0, "No HF card");
         }
     }
@@ -241,13 +269,12 @@ static gpointer w_read_lf(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         uint8_t cmd[3] = {0x28, 0x01, 0x00}, resp[FURUI_MAXMSG];
         size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 3000);
         if (r >= 3 && resp[2] == 1) {
             size_t dlen = (r > 5) ? r - 5 : 0;
-            post(a, K_READ, 1, "LF (125kHz)  data: %s", hex_str(resp + 3, dlen));
+            post(a, K_LFHID, 1, "LF (125 kHz)  data: %s", hex_str(resp + 3, dlen));
             pmpro_dump_init(&a->last);
             snprintf(a->last.card_type, sizeof a->last.card_type, "EM4100/ID");
             snprintf(a->last.frequency, sizeof a->last.frequency, "125kHz");
@@ -255,7 +282,7 @@ static gpointer w_read_lf(gpointer p)
             a->have_last = TRUE;
             em4100_info em;
             if (pmpro_decode_em4100(resp + 3, dlen, &em)) {
-                post(a, K_READ, 1, "  EM4100: id %s  customer %u  card %u  (fob %s)",
+                post(a, K_LFHID, 1, "  EM4100: id %s  customer %u  card %u  (fob %s)",
                      em.hex, em.customer, em.card_number, em.fob_text);
                 snprintf(a->last.meta, sizeof a->last.meta,
                          "EM4100 id %s customer %u card %u fob %s",
@@ -264,8 +291,28 @@ static gpointer w_read_lf(gpointer p)
             post(a, K_TOAST, 1, "LF card read");
             app_beep(a);
         } else {
-            post(a, K_READ, 0, "LF: no 125kHz card on reader");
+            post(a, K_LFHID, 0, "LF: no 125 kHz card on reader");
             post(a, K_TOAST, 0, "No LF card");
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE);
+    g_mutex_unlock(&a->lock);
+    return NULL;
+}
+
+static gpointer w_read_hid(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        uint8_t buf[64];
+        size_t n = furui_read_hid(&a->dev, buf, sizeof buf);
+        if (n) {
+            post(a, K_LFHID, 1, "HID prox (%zu bytes): %s", n, hex_str(buf, n));
+            app_beep(a);
+        } else {
+            post(a, K_LFHID, 0, "HID: no prox card on reader");
+            post(a, K_TOAST, 0, "No HID card");
         }
     }
     g_atomic_int_set(&a->busy, FALSE);
@@ -280,8 +327,7 @@ static gpointer w_raw(gpointer p)
     RawJob *j = p;
     App *a = j->a;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         uint8_t resp[FURUI_MAXMSG];
         size_t r = furui_exec(&a->dev, j->payload, j->len, resp, sizeof resp, 2000);
         post(a, K_CONSOLE, 1, "TX %s", hex_str(j->payload, j->len));
@@ -302,20 +348,35 @@ static gpointer w_write_lf(gpointer p)
     RawJob *j = p;     /* payload already built as cmd 2D ... */
     App *a = j->a;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         uint8_t resp[FURUI_MAXMSG];
         size_t r = furui_exec(&a->dev, j->payload, j->len, resp, sizeof resp, 3000);
         int ok = r >= 3 && resp[2] == 1;
-        post(a, K_READ, ok, ok ? "LF write OK (%s)" : "LF write FAILED (%s)",
+        post(a, K_LFHID, ok, ok ? "LF write OK (%s)" : "LF write FAILED (%s)",
              hex_str(j->payload, j->len));
         post(a, K_TOAST, ok, ok ? "Wrote LF card" : "LF write failed");
-        if (ok) furui_beep(&a->dev, 0x01, 0x02);
+        if (ok) app_beep(a);
     }
     g_atomic_int_set(&a->busy, FALSE);
     g_mutex_unlock(&a->lock);
     g_free(j);
     return NULL;
+}
+
+typedef struct { App *a; uint8_t id[12]; } HidJob;
+
+static gpointer w_write_hid(gpointer p)
+{
+    HidJob *j = p; App *a = j->a;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        int ok = furui_write_hid(&a->dev, j->id);
+        post(a, K_LFHID, ok, ok ? "HID write OK (%s)" : "HID write FAILED (%s)",
+             hex_str(j->id, 12));
+        post(a, K_TOAST, ok, ok ? "Wrote HID card" : "HID write failed");
+        if (ok) app_beep(a);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
 
 typedef struct { App *a; uint8_t sector; uint8_t key[6]; uint8_t data[64]; int datalen; } WSJob;
@@ -324,13 +385,28 @@ static gpointer w_write_sector(gpointer p)
 {
     WSJob *j = p; App *a = j->a;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         furui_activate(&a->dev);
         int ok = furui_write_sector(&a->dev, j->sector, 1, j->key, NULL, j->data, j->datalen);
-        post(a, K_READ, ok, ok ? "Wrote sector %d (%d bytes)" : "Write sector %d FAILED",
+        post(a, K_HF, ok, ok ? "Wrote sector %d (%d bytes)" : "Write sector %d FAILED",
              j->sector, j->datalen);
         post(a, K_TOAST, ok, ok ? "Sector written" : "Write failed");
+        if (ok) app_beep(a);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
+}
+
+typedef struct { App *a; uint8_t sector; uint8_t key[6]; } FmtJob;
+
+static gpointer w_format(gpointer p)
+{
+    FmtJob *j = p; App *a = j->a;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        int ok = furui_format_sector(&a->dev, j->sector, 1, j->key, NULL);
+        post(a, K_HF, ok, ok ? "Formatted sector %d (data zeroed, default trailer)"
+                             : "Format sector %d FAILED", j->sector);
+        post(a, K_TOAST, ok, ok ? "Sector formatted" : "Format failed");
         if (ok) app_beep(a);
     }
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
@@ -342,25 +418,22 @@ static gpointer w_write_buffer(gpointer p)
 {
     CloneJob *j = p; App *a = j->a;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         if (!a->have_last || a->last.n_blocks == 0) {
-            post(a, K_TOAST, 0, "Buffer empty — read a source card first (Read tab)");
+            post(a, K_TOAST, 0, "Buffer empty — read an HF card or load a dump first");
         } else {
             int wrote = 0;
             for (int s = 0; s < a->last.n_blocks; s++) {
                 uint8_t data[64];
                 int dl = pmpro_parse_hex(a->last.blocks[s], data, sizeof data);
                 if (dl <= 0) continue;
-                /* a read-back trailer has keyA masked to 00 — restore the dst
-                 * key so the cloned sector stays accessible. */
-                if (dl >= 64) memcpy(data + 48, j->key, 6);
+                if (dl >= 64) memcpy(data + 48, j->key, 6);   /* restore trailer keyA */
                 furui_activate(&a->dev);
                 if (furui_write_sector(&a->dev, (uint8_t)s, 1, j->key, NULL, data, dl)) {
                     wrote++;
-                    post(a, K_READ, 1, "  wrote sector %d (%d bytes)", s, dl);
+                    post(a, K_HF, 1, "  wrote sector %d (%d bytes)", s, dl);
                 } else {
-                    post(a, K_READ, 0, "  sector %d write FAILED", s);
+                    post(a, K_HF, 0, "  sector %d write FAILED", s);
                 }
             }
             post(a, K_TOAST, wrote > 0, "Wrote %d/%d buffered sectors", wrote, a->last.n_blocks);
@@ -370,76 +443,16 @@ static gpointer w_write_buffer(gpointer p)
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
 
-/* ---- edit the buffer in place + diff against a file (main thread) ------- */
-
-static void on_set_block(GtkButton *b, gpointer u)
-{
-    (void)b;
-    App *a = u;
-    if (!a->have_last || a->last.n_blocks == 0) {
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Buffer empty — read or load a card first"));
-        return;
-    }
-    int idx = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->edit_block));
-    const char *hex = gtk_editable_get_text(GTK_EDITABLE(a->edit_hex));
-    if (pmpro_dump_set_block(&a->last, idx, hex)) {
-        post(a, K_READ, 1, "Edited block %d -> %s", idx, a->last.blocks[idx]);
-        post(a, K_TOAST, 1, "Block %d updated in buffer", idx);
-    } else {
-        post(a, K_TOAST, 0, "Edit failed: index 0..%d, valid hex (≤64 bytes)",
-             a->last.n_blocks - 1);
-    }
-}
-
-static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
-{
-    App *a = u;
-    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
-    if (!f) return;
-    char *path = g_file_get_path(f);
-    pmpro_dump *other = g_new0(pmpro_dump, 1);
-    char err[128];
-    if (pmpro_dump_load(other, path, err, sizeof err)) {
-        char *buf = g_malloc(16384);
-        int n = pmpro_dump_diff(&a->last, other, buf, 16384);
-        post(a, K_READ, n == 0, "Diff: buffer vs %s — %d difference(s)", path, n);
-        char **lines = g_strsplit(buf, "\n", -1);
-        for (char **p = lines; *p; p++)
-            if (**p) post(a, K_READ, 1, "  %s", *p);
-        g_strfreev(lines);
-        g_free(buf);
-    } else {
-        post(a, K_TOAST, 0, "%s", err);
-    }
-    g_free(other);
-    g_free(path);
-    g_object_unref(f);
-}
-
-static void on_diff(GtkButton *b, gpointer u)
-{
-    (void)b;
-    App *a = u;
-    if (!a->have_last) {
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Buffer empty — read or load a card first"));
-        return;
-    }
-    GtkFileDialog *d = gtk_file_dialog_new();
-    gtk_file_dialog_open(d, a->win, NULL, on_diff_finish, a);
-}
-
-typedef struct { App *a; uint8_t block; uint8_t type; int mode; } CrackJob; /* mode 0=dict,1=darkside,2=hardnested */
+typedef struct { App *a; uint8_t block; uint8_t type; int mode; } CrackJob;
 
 static gpointer w_crack(gpointer p)
 {
     CrackJob *j = p; App *a = j->a;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         uint8_t found[6];
         const char *kt = j->type ? "B" : "A";
         if (j->mode == 3) {
-            /* nested (cmd 14): auto-find a foothold key, then crack the target */
             post(a, K_CRACK, 1, "Nested: finding a foothold key + collecting nonces "
                  "for block %d (key %s)…", j->block, kt);
             char log[256];
@@ -451,7 +464,6 @@ static gpointer w_crack(gpointer p)
                 app_beep(a);
             }
         } else if (j->mode == 2) {
-            /* hardnested with auto-foothold: dictionary on sector 0 first */
             uint8_t fk[6];
             post(a, K_CRACK, 1, "Hardnested: finding a foothold key (dictionary on block 0)…");
             if (!furui_dict_attack(&a->dev, 0, 0, fk)) {
@@ -498,9 +510,8 @@ static gpointer w_crack(gpointer p)
 
 static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
 {
-    /* atomic test-and-set: refuse a second op while one is running */
     if (!g_atomic_int_compare_and_exchange(&a->busy, FALSE, TRUE)) {
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…"));
+        toast(a, "Busy…");
         if (arg) g_free(arg);
         return FALSE;
     }
@@ -508,22 +519,25 @@ static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
     return TRUE;
 }
 
-/* ---- button callbacks -------------------------------------------------- */
+/* ---- button callbacks (main thread) ------------------------------------ */
+
+static void settings_save(App *a);   /* fwd: defined with the settings code */
 
 static void on_connect(GtkButton *b, gpointer u) { (void)b; start_op(u, w_connect, NULL); }
 static void on_beep(GtkButton *b, gpointer u)    { (void)b; start_op(u, w_beep, NULL); }
-static void settings_save(App *a);   /* fwd: defined with the settings code */
+static void on_openfind(GtkButton *b, gpointer u){ (void)b; start_op(u, w_openfind, NULL); }
 static void on_mute(GtkCheckButton *b, gpointer u)
 {
     App *a = u;
     a->mute = gtk_check_button_get_active(b);
     settings_save(a);
 }
+
+/* read the key entry into cur_key (default FFFFFFFFFFFF) before reading HF */
 static void on_read_hf(GtkButton *b, gpointer u)
 {
     (void)b;
     App *a = u;
-    /* capture the key on the main thread (default to FFFFFFFFFFFF) */
     const char *t = gtk_editable_get_text(GTK_EDITABLE(a->key_entry));
     uint8_t k[6];
     if (pmpro_parse_hex(t, k, sizeof k) == 6)
@@ -533,6 +547,7 @@ static void on_read_hf(GtkButton *b, gpointer u)
     start_op(a, w_read_hf, NULL);
 }
 static void on_read_lf(GtkButton *b, gpointer u) { (void)b; start_op(u, w_read_lf, NULL); }
+static void on_read_hid(GtkButton *b, gpointer u) { (void)b; start_op(u, w_read_hid, NULL); }
 
 static void on_send_raw(GtkButton *b, gpointer u)
 {
@@ -542,7 +557,7 @@ static void on_send_raw(GtkButton *b, gpointer u)
     RawJob *j = g_new0(RawJob, 1);
     j->a = a;
     int n = pmpro_parse_hex(t, j->payload, sizeof j->payload);
-    if (n <= 0) { g_free(j); adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Bad hex")); return; }
+    if (n <= 0) { g_free(j); toast(a, "Bad hex"); return; }
     j->len = n;
     start_op(a, w_raw, j);
 }
@@ -551,18 +566,27 @@ static void on_write_lf(GtkButton *b, gpointer u)
 {
     (void)b;
     App *a = u;
-    /* entry holds "freq,id0,id1,id2,id3,plant" hex; build cmd 2D payload */
-    const char *t = gtk_editable_get_text(GTK_EDITABLE(a->wr_entry));
+    const char *t = gtk_editable_get_text(GTK_EDITABLE(a->lf_entry));
     uint8_t fields[16];
     int n = pmpro_parse_hex(t, fields, sizeof fields);
-    if (n < 6) { adw_toast_overlay_add_toast(a->toasts,
-                 adw_toast_new("Need: freq id0 id1 id2 id3 plant")); return; }
+    if (n < 6) { toast(a, "Need: freq id0 id1 id2 id3 plant"); return; }
     RawJob *j = g_new0(RawJob, 1);
     j->a = a;
     j->payload[0] = 0x2D;
     memcpy(j->payload + 1, fields, 6);
     j->len = 7;
     start_op(a, w_write_lf, j);
+}
+
+static void on_write_hid(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    const char *t = gtk_editable_get_text(GTK_EDITABLE(a->hid_entry));
+    HidJob *j = g_new0(HidJob, 1); j->a = a;
+    if (pmpro_parse_hex(t, j->id, 12) != 12) {
+        g_free(j); toast(a, "HID needs a 12-byte card id in hex"); return;
+    }
+    start_op(a, w_write_hid, j);
 }
 
 static void on_write_sector(GtkButton *b, gpointer u)
@@ -574,9 +598,19 @@ static void on_write_sector(GtkButton *b, gpointer u)
     if (pmpro_parse_hex(kt, j->key, 6) != 6) memset(j->key, 0xFF, 6);
     const char *dt = gtk_editable_get_text(GTK_EDITABLE(a->ws_data));
     int dl = pmpro_parse_hex(dt, j->data, sizeof j->data);
-    if (dl <= 0) { g_free(j); adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Enter data hex")); return; }
+    if (dl <= 0) { g_free(j); toast(a, "Enter sector data hex"); return; }
     j->datalen = dl;
     start_op(a, w_write_sector, j);
+}
+
+static void on_format(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    FmtJob *j = g_new0(FmtJob, 1); j->a = a;
+    j->sector = (uint8_t)gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->fmt_sector));
+    const char *kt = gtk_editable_get_text(GTK_EDITABLE(a->fmt_key));
+    if (pmpro_parse_hex(kt, j->key, 6) != 6) memset(j->key, 0xFF, 6);
+    start_op(a, w_format, j);
 }
 
 static void on_write_buffer(GtkButton *b, gpointer u)
@@ -602,6 +636,8 @@ static void on_darkside(GtkButton *b, gpointer u) { (void)b; start_crack(u, 1); 
 static void on_hardnested(GtkButton *b, gpointer u) { (void)b; start_crack(u, 2); }
 static void on_nested(GtkButton *b, gpointer u) { (void)b; start_crack(u, 3); }
 
+/* ---- dump tab: file + edit + diff (main thread) ------------------------ */
+
 static void on_save_finish(GObject *src, GAsyncResult *res, gpointer u)
 {
     App *a = u;
@@ -610,11 +646,19 @@ static void on_save_finish(GObject *src, GAsyncResult *res, gpointer u)
     char *path = g_file_get_path(f);
     char err[128];
     if (a->have_last && pmpro_dump_save_auto(&a->last, path, err, sizeof err))
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Saved dump"));
+        post(a, K_DUMP, 1, "Saved → %s", path);
     else
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Nothing to save / error"));
+        toast(a, a->have_last ? "Save error" : "Buffer empty — nothing to save");
     g_free(path);
     g_object_unref(f);
+}
+
+static void on_save(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_initial_name(d, "card.pmdump");
+    gtk_file_dialog_save(d, a->win, NULL, on_save_finish, a);
 }
 
 static void on_export_finish(GObject *src, GAsyncResult *res, gpointer u)
@@ -625,30 +669,19 @@ static void on_export_finish(GObject *src, GAsyncResult *res, gpointer u)
     char *path = g_file_get_path(f);
     char err[128];
     if (a->have_last && pmpro_dump_save_mfd(&a->last, path, err, sizeof err))
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Exported .mfd"));
+        post(a, K_DUMP, 1, "Exported raw .mfd → %s", path);
     else
-        adw_toast_overlay_add_toast(a->toasts,
-            adw_toast_new(a->have_last ? "Export failed" : "Nothing to export — read/load a card first"));
+        toast(a, a->have_last ? "Export failed" : "Buffer empty — nothing to export");
     g_free(path);
     g_object_unref(f);
 }
 
 static void on_export(GtkButton *b, gpointer u)
 {
-    (void)b;
-    App *a = u;
+    (void)b; App *a = u;
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_set_initial_name(d, "card.mfd");
     gtk_file_dialog_save(d, a->win, NULL, on_export_finish, a);
-}
-
-static void on_save(GtkButton *b, gpointer u)
-{
-    (void)b;
-    App *a = u;
-    GtkFileDialog *d = gtk_file_dialog_new();
-    gtk_file_dialog_set_initial_name(d, "card.pmdump");
-    gtk_file_dialog_save(d, a->win, NULL, on_save_finish, a);
 }
 
 static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
@@ -660,12 +693,13 @@ static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
     char err[128];
     if (pmpro_dump_load(&a->last, path, err, sizeof err)) {
         a->have_last = TRUE;
-        post(a, K_READ, 1, "Loaded dump: %s — %s/%s, UID %s, %d block(s)%s%s",
+        post(a, K_DUMP, 1, "Loaded %s — %s / %s, UID %s, %d sector(s)%s%s",
              path, a->last.card_type, a->last.frequency, a->last.uid,
              a->last.n_blocks, a->last.meta[0] ? " — " : "", a->last.meta);
         post(a, K_TOAST, 1, "Dump loaded into buffer");
     } else {
-        post(a, K_TOAST, 0, "%s", err);
+        post(a, K_DUMP, 0, "Load failed: %s", err);
+        toast(a, err);
     }
     g_free(path);
     g_object_unref(f);
@@ -673,15 +707,71 @@ static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
 
 static void on_load(GtkButton *b, gpointer u)
 {
-    (void)b;
-    App *a = u;
-    if (g_atomic_int_get(&a->busy)) {
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…"));
-        return;
-    }
+    (void)b; App *a = u;
+    if (g_atomic_int_get(&a->busy)) { toast(a, "Busy…"); return; }
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_open(d, a->win, NULL, on_load_finish, a);
 }
+
+static void on_print_buffer(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last) { toast(a, "Buffer empty — read or load a card first"); return; }
+    post(a, K_DUMP, 1, "Buffer: %s / %s, UID %s, %d sector(s)%s%s",
+         a->last.card_type, a->last.frequency, a->last.uid, a->last.n_blocks,
+         a->last.meta[0] ? " — " : "", a->last.meta);
+    for (int i = 0; i < a->last.n_blocks; i++)
+        post(a, K_DUMP, 1, "  [%2d] %s", i, a->last.blocks[i]);
+}
+
+static void on_set_block(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last || a->last.n_blocks == 0) { toast(a, "Buffer empty — read or load a card first"); return; }
+    int idx = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->edit_block));
+    const char *hex = gtk_editable_get_text(GTK_EDITABLE(a->edit_hex));
+    if (pmpro_dump_set_block(&a->last, idx, hex)) {
+        post(a, K_DUMP, 1, "Edited block %d → %s", idx, a->last.blocks[idx]);
+        post(a, K_TOAST, 1, "Block %d updated", idx);
+    } else {
+        post(a, K_DUMP, 0, "Edit failed: index 0..%d, valid hex (≤64 bytes)", a->last.n_blocks - 1);
+    }
+}
+
+static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    pmpro_dump *other = g_new0(pmpro_dump, 1);
+    char err[128];
+    if (pmpro_dump_load(other, path, err, sizeof err)) {
+        char *buf = g_malloc(16384);
+        int n = pmpro_dump_diff(&a->last, other, buf, 16384);
+        post(a, K_DUMP, n == 0, "Diff: buffer vs %s — %d difference(s)", path, n);
+        char **lines = g_strsplit(buf, "\n", -1);
+        for (char **p = lines; *p; p++)
+            if (**p) post(a, K_DUMP, 1, "  %s", *p);
+        g_strfreev(lines);
+        g_free(buf);
+    } else {
+        toast(a, err);
+    }
+    g_free(other);
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_diff(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last) { toast(a, "Buffer empty — read or load a card first"); return; }
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_open(d, a->win, NULL, on_diff_finish, a);
+}
+
+/* ---- crack tab: load keys + autopwn ------------------------------------ */
 
 static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
 {
@@ -695,12 +785,12 @@ static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
         if (!a->key_files)
             a->key_files = g_ptr_array_new_with_free_func(g_free);
         g_ptr_array_add(a->key_files, g_strdup(path));
-        settings_save(a);     /* remember the file so it reloads next launch */
+        settings_save(a);
         post(a, K_CRACK, 1, "Loaded %d key(s) from %s — %d in dictionary now",
              n, path, furui_keys_count());
         post(a, K_TOAST, 1, "Loaded %d keys (%d total)", n, furui_keys_count());
     } else {
-        post(a, K_TOAST, 0, "%s", err);
+        toast(a, err);
     }
     g_free(path);
     g_object_unref(f);
@@ -708,30 +798,19 @@ static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
 
 static void on_load_keys(GtkButton *b, gpointer u)
 {
-    (void)b;
-    App *a = u;
-    if (g_atomic_int_get(&a->busy)) {
-        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…"));
-        return;
-    }
+    (void)b; App *a = u;
+    if (g_atomic_int_get(&a->busy)) { toast(a, "Busy…"); return; }
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_open(d, a->win, NULL, on_load_keys_finish, a);
 }
 
-/* ---- autopwn → .mfd ---------------------------------------------------- */
-
-/* progress hook, called on the worker thread from inside furui_autopwn */
-static void gui_prog(const char *msg, void *u)
-{
-    post((App *)u, K_CRACK, 1, "  %s", msg);
-}
+static void gui_prog(const char *msg, void *u) { post((App *)u, K_CRACK, 1, "  %s", msg); }
 
 static gpointer w_autopwn(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
-    if (ensure_open(a)) {
-        if (!a->connected) a->connected = furui_connect(&a->dev);
+    if (ensure_ready(a)) {
         post(a, K_CRACK, 1, "Autopwn → %s : dictionary + nested across every "
              "sector, then dumping the whole card…", a->mfd_path);
         char log[256];
@@ -756,9 +835,8 @@ static void on_autopwn_save_finish(GObject *src, GAsyncResult *res, gpointer u)
 
 static void on_autopwn(GtkButton *b, gpointer u)
 {
-    (void)b;
-    App *a = u;
-    if (g_atomic_int_get(&a->busy)) { adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…")); return; }
+    (void)b; App *a = u;
+    if (g_atomic_int_get(&a->busy)) { toast(a, "Busy…"); return; }
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_set_initial_name(d, "card.mfd");
     gtk_file_dialog_save(d, a->win, NULL, on_autopwn_save_finish, a);
@@ -854,16 +932,19 @@ static void settings_load(App *a)
     g_free(path);
 }
 
-/* ---- UI construction --------------------------------------------------- */
+/* ---- UI construction helpers ------------------------------------------- */
 
-static GtkWidget *mono_view(GtkTextBuffer **buf)
+static GtkWidget *mono_view(GtkTextBuffer **buf, const char *intro)
 {
     GtkWidget *v = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(v), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(v), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(v), GTK_WRAP_WORD_CHAR);
     gtk_widget_set_margin_start(v, 8); gtk_widget_set_margin_end(v, 8);
     gtk_widget_set_margin_top(v, 8); gtk_widget_set_margin_bottom(v, 8);
-    if (buf) *buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(v));
+    GtkTextBuffer *b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(v));
+    if (buf) *buf = b;
+    if (intro) gtk_text_buffer_set_text(b, intro, -1);
     return v;
 }
 
@@ -875,85 +956,16 @@ static GtkWidget *scrolled(GtkWidget *child)
     return s;
 }
 
-static GtkWidget *pad_box(int spacing)
+/* a tab page is a vertical box (controls) over a scrolled log view */
+static GtkWidget *page_box(void)
 {
-    GtkWidget *b = gtk_box_new(GTK_ORIENTATION_VERTICAL, spacing);
+    GtkWidget *b = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_widget_set_margin_start(b, 12); gtk_widget_set_margin_end(b, 12);
     gtk_widget_set_margin_top(b, 12); gtk_widget_set_margin_bottom(b, 12);
     return b;
 }
 
-static GtkWidget *page_device(App *a)
-{
-    GtkWidget *box = pad_box(10);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *conn = gtk_button_new_with_label("Connect");
-    gtk_widget_add_css_class(conn, "suggested-action");
-    g_signal_connect(conn, "clicked", G_CALLBACK(on_connect), a);
-    GtkWidget *beep = gtk_button_new_with_label("Beep");
-    g_signal_connect(beep, "clicked", G_CALLBACK(on_beep), a);
-    GtkWidget *mute = gtk_check_button_new_with_label("Mute beeps");
-    a->mute_check = mute;
-    gtk_widget_set_tooltip_text(mute, "Suppress the confirmation beep after "
-                                "connect/read/write/crack (the Beep button still works)");
-    g_signal_connect(mute, "toggled", G_CALLBACK(on_mute), a);
-    gtk_box_append(GTK_BOX(row), conn);
-    gtk_box_append(GTK_BOX(row), beep);
-    gtk_box_append(GTK_BOX(row), mute);
-    gtk_box_append(GTK_BOX(box), row);
-
-    a->info_label = gtk_label_new("Not connected. Click Connect to identify the "
-                                  "FR-RATEL and run the RC4 handshake.");
-    gtk_label_set_xalign(GTK_LABEL(a->info_label), 0);
-    gtk_label_set_wrap(GTK_LABEL(a->info_label), TRUE);
-    gtk_widget_add_css_class(a->info_label, "dim-label");
-    gtk_box_append(GTK_BOX(box), a->info_label);
-    return box;
-}
-
-static GtkWidget *page_read(App *a)
-{
-    GtkWidget *box = pad_box(8);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *hf = gtk_button_new_with_label("Read HF (13.56 MHz)");
-    gtk_widget_add_css_class(hf, "suggested-action");
-    g_signal_connect(hf, "clicked", G_CALLBACK(on_read_hf), a);
-    GtkWidget *lf = gtk_button_new_with_label("Read LF (125 kHz)");
-    g_signal_connect(lf, "clicked", G_CALLBACK(on_read_lf), a);
-    GtkWidget *save = gtk_button_new_with_label("Save dump…");
-    g_signal_connect(save, "clicked", G_CALLBACK(on_save), a);
-    GtkWidget *load = gtk_button_new_with_label("Load dump…");
-    gtk_widget_set_tooltip_text(load, "Load a .pmdump or raw .mfd into the buffer, "
-                                "then write it to a blank from the Write / Clone tab");
-    g_signal_connect(load, "clicked", G_CALLBACK(on_load), a);
-    GtkWidget *expo = gtk_button_new_with_label("Export .mfd…");
-    gtk_widget_set_tooltip_text(expo, "Export the buffer as a raw binary Mifare "
-                                ".mfd dump (libnfc/Proxmark compatible)");
-    g_signal_connect(expo, "clicked", G_CALLBACK(on_export), a);
-    gtk_box_append(GTK_BOX(row), hf);
-    gtk_box_append(GTK_BOX(row), lf);
-    gtk_box_append(GTK_BOX(row), save);
-    gtk_box_append(GTK_BOX(row), load);
-    gtk_box_append(GTK_BOX(row), expo);
-    gtk_box_append(GTK_BOX(box), row);
-
-    GtkWidget *krow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *klab = gtk_label_new("Mifare key A:");
-    a->key_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->key_entry),
-                                   "FF FF FF FF FF FF (default)");
-    gtk_widget_set_hexpand(a->key_entry, TRUE);
-    gtk_box_append(GTK_BOX(krow), klab);
-    gtk_box_append(GTK_BOX(krow), a->key_entry);
-    gtk_box_append(GTK_BOX(box), krow);
-
-    GtkWidget *v = mono_view(&a->read_buf);
-    a->read_view = v;
-    gtk_text_buffer_set_text(a->read_buf,
-        "Place a card on the reader and click Read.\n", -1);
-    gtk_box_append(GTK_BOX(box), scrolled(v));
-    return box;
-}
+static GtkWidget *hrow(void) { return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8); }
 
 static GtkWidget *section_label(const char *text)
 {
@@ -964,178 +976,246 @@ static GtkWidget *section_label(const char *text)
     return l;
 }
 
-static GtkWidget *page_write(App *a)
+static GtkWidget *hint_label(const char *text)
 {
-    GtkWidget *box = pad_box(8);
+    GtkWidget *l = gtk_label_new(text);
+    gtk_label_set_xalign(GTK_LABEL(l), 0);
+    gtk_label_set_wrap(GTK_LABEL(l), TRUE);
+    gtk_widget_add_css_class(l, "dim-label");
+    return l;
+}
 
-    /* ---- HF: write one Mifare sector ---- */
-    gtk_box_append(GTK_BOX(box), section_label("Write Mifare sector (13.56 MHz)"));
-    GtkWidget *r1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(r1), gtk_label_new("Sector"));
-    a->ws_sector = gtk_spin_button_new_with_range(0, 39, 1);
-    a->ws_key = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->ws_key), "key A: FF FF FF FF FF FF");
-    gtk_widget_set_hexpand(a->ws_key, TRUE);
-    gtk_box_append(GTK_BOX(r1), a->ws_sector);
-    gtk_box_append(GTK_BOX(r1), a->ws_key);
-    gtk_box_append(GTK_BOX(box), r1);
-    GtkWidget *r2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    a->ws_data = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->ws_data),
-                                   "sector data hex (up to 64 bytes = 4 blocks)");
-    gtk_widget_set_hexpand(a->ws_data, TRUE);
-    GtkWidget *wsbtn = gtk_button_new_with_label("Write sector");
-    gtk_widget_add_css_class(wsbtn, "destructive-action");
-    g_signal_connect(wsbtn, "clicked", G_CALLBACK(on_write_sector), a);
-    gtk_box_append(GTK_BOX(r2), a->ws_data);
-    gtk_box_append(GTK_BOX(r2), wsbtn);
-    gtk_box_append(GTK_BOX(box), r2);
+static GtkWidget *btn(const char *label, const char *css, GCallback cb, gpointer u)
+{
+    GtkWidget *b = gtk_button_new_with_label(label);
+    if (css) gtk_widget_add_css_class(b, css);
+    g_signal_connect(b, "clicked", cb, u);
+    return b;
+}
 
-    /* ---- Clone: write the read buffer to a blank ---- */
-    gtk_box_append(GTK_BOX(box), section_label("Clone to a blank card"));
-    GtkWidget *chint = gtk_label_new(
-        "1. On the Read tab, read the SOURCE card (with its key) — sectors go to a buffer.\n"
-        "2. Swap to a UID-changeable/magic blank, set its key A below, and write the buffer.");
-    gtk_label_set_xalign(GTK_LABEL(chint), 0);
-    gtk_label_set_wrap(GTK_LABEL(chint), TRUE);
-    gtk_widget_add_css_class(chint, "dim-label");
-    gtk_box_append(GTK_BOX(box), chint);
-    GtkWidget *r3 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    a->clone_key = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->clone_key), "blank key A: FF FF FF FF FF FF");
-    gtk_widget_set_hexpand(a->clone_key, TRUE);
-    GtkWidget *clbtn = gtk_button_new_with_label("Write buffer → card");
-    gtk_widget_add_css_class(clbtn, "destructive-action");
-    g_signal_connect(clbtn, "clicked", G_CALLBACK(on_write_buffer), a);
-    gtk_box_append(GTK_BOX(r3), a->clone_key);
-    gtk_box_append(GTK_BOX(r3), clbtn);
-    gtk_box_append(GTK_BOX(box), r3);
+static GtkWidget *entry_exp(const char *placeholder)
+{
+    GtkWidget *e = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(e), placeholder);
+    gtk_widget_set_hexpand(e, TRUE);
+    return e;
+}
 
-    /* ---- Edit / Diff the buffer ---- */
-    gtk_box_append(GTK_BOX(box), section_label("Edit / compare buffer"));
-    GtkWidget *ehint = gtk_label_new(
-        "Edit a block of the read/loaded buffer, or diff the buffer against a "
-        ".pmdump file. Results print on the Read tab.");
-    gtk_label_set_xalign(GTK_LABEL(ehint), 0);
-    gtk_label_set_wrap(GTK_LABEL(ehint), TRUE);
-    gtk_widget_add_css_class(ehint, "dim-label");
-    gtk_box_append(GTK_BOX(box), ehint);
-    GtkWidget *r5 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_append(GTK_BOX(r5), gtk_label_new("Block"));
-    a->edit_block = gtk_spin_button_new_with_range(0, PMPRO_MAX_BLOCKS - 1, 1);
-    a->edit_hex = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->edit_hex), "new block hex (≤64 bytes)");
-    gtk_widget_set_hexpand(a->edit_hex, TRUE);
-    GtkWidget *setbtn = gtk_button_new_with_label("Set block");
-    g_signal_connect(setbtn, "clicked", G_CALLBACK(on_set_block), a);
-    GtkWidget *diffbtn = gtk_button_new_with_label("Diff vs file…");
-    g_signal_connect(diffbtn, "clicked", G_CALLBACK(on_diff), a);
-    gtk_box_append(GTK_BOX(r5), a->edit_block);
-    gtk_box_append(GTK_BOX(r5), a->edit_hex);
-    gtk_box_append(GTK_BOX(r5), setbtn);
-    gtk_box_append(GTK_BOX(r5), diffbtn);
-    gtk_box_append(GTK_BOX(box), r5);
+/* ---- pages ------------------------------------------------------------- */
 
-    /* ---- LF: write a 125 kHz ID card ---- */
-    gtk_box_append(GTK_BOX(box), section_label("Write 125 kHz ID card (T5577/EM4305)"));
-    GtkWidget *lhint = gtk_label_new("6 hex bytes: freq id0 id1 id2 id3 plant");
-    gtk_label_set_xalign(GTK_LABEL(lhint), 0);
-    gtk_widget_add_css_class(lhint, "dim-label");
-    gtk_box_append(GTK_BOX(box), lhint);
-    GtkWidget *r4 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    a->wr_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->wr_entry), "00 12 34 56 78 00");
-    gtk_widget_set_hexpand(a->wr_entry, TRUE);
-    GtkWidget *w = gtk_button_new_with_label("Write LF card");
-    gtk_widget_add_css_class(w, "destructive-action");
-    g_signal_connect(w, "clicked", G_CALLBACK(on_write_lf), a);
-    gtk_box_append(GTK_BOX(r4), a->wr_entry);
-    gtk_box_append(GTK_BOX(r4), w);
-    gtk_box_append(GTK_BOX(box), r4);
+static GtkWidget *page_device(App *a)
+{
+    GtkWidget *box = page_box();
+    GtkWidget *row = hrow();
+    gtk_box_append(GTK_BOX(row), btn("Connect", "suggested-action", G_CALLBACK(on_connect), a));
+    gtk_box_append(GTK_BOX(row), btn("Beep", NULL, G_CALLBACK(on_beep), a));
+    GtkWidget *find = btn("Find / scan", NULL, G_CALLBACK(on_openfind), a);
+    gtk_widget_set_tooltip_text(find, "Turn on the device's card-scan indicator (cmd 0F)");
+    gtk_box_append(GTK_BOX(row), find);
+    GtkWidget *mute = gtk_check_button_new_with_label("Mute beeps");
+    a->mute_check = mute;
+    gtk_widget_set_tooltip_text(mute, "Suppress confirmation beeps (the Beep button still works)");
+    g_signal_connect(mute, "toggled", G_CALLBACK(on_mute), a);
+    gtk_box_append(GTK_BOX(row), mute);
+    gtk_box_append(GTK_BOX(box), row);
+
+    a->info_label = gtk_label_new("Not connected. Click Connect to identify the "
+                                  "FR-RATEL and run the RC4 handshake.");
+    gtk_label_set_xalign(GTK_LABEL(a->info_label), 0);
+    gtk_label_set_wrap(GTK_LABEL(a->info_label), TRUE);
+    gtk_widget_add_css_class(a->info_label, "dim-label");
+    gtk_box_append(GTK_BOX(box), a->info_label);
+
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "Quick start:\n"
+        "• HF (Mifare): read a 13.56 MHz card, write/format sectors, clone to a blank.\n"
+        "• LF / HID: read & write 125 kHz EM4100/T5577 and HID prox cards.\n"
+        "• Crack: recover Mifare keys (dictionary / nested / darkside / hardnested) and autopwn.\n"
+        "• Dump: load/save/export (.pmdump or raw .mfd), edit a block, diff two dumps.\n"
+        "• Console: send raw protocol payloads.\n\n"
+        "Use only on cards you own or are authorized to test."));
     return box;
 }
 
-static GtkWidget *page_console(App *a)
+static GtkWidget *page_hf(App *a)
 {
-    GtkWidget *box = pad_box(8);
-    GtkWidget *v = mono_view(&a->console_buf);
-    a->console_view = v;
-    gtk_text_buffer_set_text(a->console_buf,
-        "Raw protocol console. Enter a command PAYLOAD in hex (the app adds "
-        "framing, CRC16 and RC4). Response is shown decrypted.\n"
-        "Examples:  06 (identify)   09 01 02 (beep)   21 (read HF)\n\n", -1);
-    gtk_box_append(GTK_BOX(box), scrolled(v));
+    GtkWidget *box = page_box();
 
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    a->hex_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(a->hex_entry), "payload hex, e.g. 21");
-    gtk_widget_set_hexpand(a->hex_entry, TRUE);
-    g_signal_connect(a->hex_entry, "activate", G_CALLBACK(on_send_raw), a);
-    GtkWidget *send = gtk_button_new_with_label("Send");
-    gtk_widget_add_css_class(send, "suggested-action");
-    g_signal_connect(send, "clicked", G_CALLBACK(on_send_raw), a);
-    gtk_box_append(GTK_BOX(row), a->hex_entry);
-    gtk_box_append(GTK_BOX(row), send);
-    gtk_box_append(GTK_BOX(box), row);
+    /* read */
+    gtk_box_append(GTK_BOX(box), section_label("Read Mifare card"));
+    GtkWidget *r0 = hrow();
+    gtk_box_append(GTK_BOX(r0), gtk_label_new("Key A"));
+    a->key_entry = entry_exp("FF FF FF FF FF FF (default)");
+    gtk_box_append(GTK_BOX(r0), a->key_entry);
+    gtk_box_append(GTK_BOX(r0), btn("Read HF", "suggested-action", G_CALLBACK(on_read_hf), a));
+    gtk_box_append(GTK_BOX(box), r0);
+
+    /* write sector */
+    gtk_box_append(GTK_BOX(box), section_label("Write sector"));
+    GtkWidget *r1 = hrow();
+    gtk_box_append(GTK_BOX(r1), gtk_label_new("Sector"));
+    a->ws_sector = gtk_spin_button_new_with_range(0, 39, 1);
+    gtk_box_append(GTK_BOX(r1), a->ws_sector);
+    a->ws_key = entry_exp("key A: FF FF FF FF FF FF");
+    gtk_box_append(GTK_BOX(r1), a->ws_key);
+    gtk_box_append(GTK_BOX(box), r1);
+    GtkWidget *r2 = hrow();
+    a->ws_data = entry_exp("sector data hex (up to 64 bytes = 4 blocks)");
+    gtk_box_append(GTK_BOX(r2), a->ws_data);
+    gtk_box_append(GTK_BOX(r2), btn("Write sector", "destructive-action", G_CALLBACK(on_write_sector), a));
+    gtk_box_append(GTK_BOX(box), r2);
+
+    /* format sector */
+    gtk_box_append(GTK_BOX(box), section_label("Format sector"));
+    GtkWidget *r3 = hrow();
+    gtk_box_append(GTK_BOX(r3), gtk_label_new("Sector"));
+    a->fmt_sector = gtk_spin_button_new_with_range(0, 39, 1);
+    gtk_box_append(GTK_BOX(r3), a->fmt_sector);
+    a->fmt_key = entry_exp("key A: FF FF FF FF FF FF");
+    gtk_box_append(GTK_BOX(r3), a->fmt_key);
+    gtk_box_append(GTK_BOX(r3), btn("Format", "destructive-action", G_CALLBACK(on_format), a));
+    gtk_box_append(GTK_BOX(box), r3);
+
+    /* clone */
+    gtk_box_append(GTK_BOX(box), section_label("Clone buffer → blank card"));
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "Read a source card above (or load a dump on the Dump tab), then swap to a "
+        "UID-changeable/magic blank, set its key A, and write the buffer."));
+    GtkWidget *r4 = hrow();
+    a->clone_key = entry_exp("blank key A: FF FF FF FF FF FF");
+    gtk_box_append(GTK_BOX(r4), a->clone_key);
+    gtk_box_append(GTK_BOX(r4), btn("Write buffer → card", "destructive-action", G_CALLBACK(on_write_buffer), a));
+    gtk_box_append(GTK_BOX(box), r4);
+
+    GtkWidget *hfv = mono_view(&a->hf_buf,
+        "Place a Mifare card on the reader and click Read HF.\n");
+    a->hf_view = hfv;
+    gtk_box_append(GTK_BOX(box), scrolled(hfv));
+    return box;
+}
+
+static GtkWidget *page_lfhid(App *a)
+{
+    GtkWidget *box = page_box();
+
+    gtk_box_append(GTK_BOX(box), section_label("LF 125 kHz (EM4100 / T5577 / EM4305)"));
+    GtkWidget *r0 = hrow();
+    gtk_box_append(GTK_BOX(r0), btn("Read LF", "suggested-action", G_CALLBACK(on_read_lf), a));
+    gtk_box_append(GTK_BOX(box), r0);
+    gtk_box_append(GTK_BOX(box), hint_label("Write: 6 hex bytes — freq id0 id1 id2 id3 plant"));
+    GtkWidget *r1 = hrow();
+    a->lf_entry = entry_exp("00 12 34 56 78 00");
+    gtk_box_append(GTK_BOX(r1), a->lf_entry);
+    gtk_box_append(GTK_BOX(r1), btn("Write LF card", "destructive-action", G_CALLBACK(on_write_lf), a));
+    gtk_box_append(GTK_BOX(box), r1);
+
+    gtk_box_append(GTK_BOX(box), section_label("HID Prox"));
+    GtkWidget *r2 = hrow();
+    gtk_box_append(GTK_BOX(r2), btn("Read HID", "suggested-action", G_CALLBACK(on_read_hid), a));
+    gtk_box_append(GTK_BOX(box), r2);
+    gtk_box_append(GTK_BOX(box), hint_label("Write: a 12-byte HID card id in hex"));
+    GtkWidget *r3 = hrow();
+    a->hid_entry = entry_exp("12-byte card id, e.g. 00 00 ...");
+    gtk_box_append(GTK_BOX(r3), a->hid_entry);
+    gtk_box_append(GTK_BOX(r3), btn("Write HID card", "destructive-action", G_CALLBACK(on_write_hid), a));
+    gtk_box_append(GTK_BOX(box), r3);
+
+    GtkWidget *lv = mono_view(&a->lfhid_buf, "Read/write 125 kHz and HID prox cards here.\n");
+    a->lfhid_view = lv;
+    gtk_box_append(GTK_BOX(box), scrolled(lv));
     return box;
 }
 
 static GtkWidget *page_crack(App *a)
 {
-    GtkWidget *box = pad_box(8);
-    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *box = page_box();
+    GtkWidget *row = hrow();
     gtk_box_append(GTK_BOX(row), gtk_label_new("Block"));
     a->crack_block = gtk_spin_button_new_with_range(0, 255, 1);
     gtk_spin_button_set_value(GTK_SPIN_BUTTON(a->crack_block), 4);
-    a->crack_typeB = gtk_check_button_new_with_label("Key B");
-    GtkWidget *dict = gtk_button_new_with_label("Dictionary check");
-    gtk_widget_add_css_class(dict, "suggested-action");
-    g_signal_connect(dict, "clicked", G_CALLBACK(on_dict), a);
-    GtkWidget *dark = gtk_button_new_with_label("Darkside crack");
-    g_signal_connect(dark, "clicked", G_CALLBACK(on_darkside), a);
-    GtkWidget *nest = gtk_button_new_with_label("Nested crack");
-    gtk_widget_add_css_class(nest, "suggested-action");
-    g_signal_connect(nest, "clicked", G_CALLBACK(on_nested), a);
-    GtkWidget *hard = gtk_button_new_with_label("Hardnested");
-    g_signal_connect(hard, "clicked", G_CALLBACK(on_hardnested), a);
     gtk_box_append(GTK_BOX(row), a->crack_block);
+    a->crack_typeB = gtk_check_button_new_with_label("Key B");
     gtk_box_append(GTK_BOX(row), a->crack_typeB);
-    gtk_box_append(GTK_BOX(row), dict);
-    gtk_box_append(GTK_BOX(row), nest);
-    gtk_box_append(GTK_BOX(row), dark);
-    gtk_box_append(GTK_BOX(row), hard);
+    gtk_box_append(GTK_BOX(row), btn("Dictionary", "suggested-action", G_CALLBACK(on_dict), a));
+    gtk_box_append(GTK_BOX(row), btn("Nested", "suggested-action", G_CALLBACK(on_nested), a));
+    gtk_box_append(GTK_BOX(row), btn("Darkside", NULL, G_CALLBACK(on_darkside), a));
+    gtk_box_append(GTK_BOX(row), btn("Hardnested", NULL, G_CALLBACK(on_hardnested), a));
     gtk_box_append(GTK_BOX(box), row);
 
-    /* whole-card autopwn → .mfd dump, on its own row */
-    GtkWidget *arow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *autop = gtk_button_new_with_label("Autopwn → .mfd");
-    gtk_widget_add_css_class(autop, "suggested-action");
-    gtk_widget_set_tooltip_text(autop, "Recover every sector key (dictionary + "
-        "nested) and dump the whole card to a .mfd file");
-    g_signal_connect(autop, "clicked", G_CALLBACK(on_autopwn), a);
+    GtkWidget *arow = hrow();
     gtk_box_append(GTK_BOX(arow), gtk_label_new("Whole card:"));
+    GtkWidget *autop = btn("Autopwn → .mfd", "suggested-action", G_CALLBACK(on_autopwn), a);
+    gtk_widget_set_tooltip_text(autop, "Recover every sector key (dictionary + nested) "
+        "and dump the whole card to a .mfd file");
     gtk_box_append(GTK_BOX(arow), autop);
-    GtkWidget *lkeys = gtk_button_new_with_label("Load keys…");
-    gtk_widget_set_tooltip_text(lkeys, "Import a MifareClassicTool .keys file; the "
-        "keys extend the dictionary used by Dictionary/Nested/Autopwn");
-    g_signal_connect(lkeys, "clicked", G_CALLBACK(on_load_keys), a);
+    GtkWidget *lkeys = btn("Load keys…", NULL, G_CALLBACK(on_load_keys), a);
+    gtk_widget_set_tooltip_text(lkeys, "Import a MifareClassicTool .keys file; the keys "
+        "extend the dictionary used by Dictionary/Nested/Autopwn (remembered across launches)");
     gtk_box_append(GTK_BOX(arow), lkeys);
     gtk_box_append(GTK_BOX(box), arow);
 
-    GtkWidget *view = mono_view(&a->crack_buf);
-    a->crack_view = view;
-    gtk_text_buffer_set_text(a->crack_buf,
-        "Mifare key recovery.\n"
-        "• Dictionary check: tries common/default keys against the block (cmd 13).\n"
-        "• Nested crack: auto-finds a foothold key, then recovers the target key\n"
-        "  with the nested attack (Crypto-1, ~10–30 s).\n"
-        "• Darkside crack: collects nonces (cmd 15), solves with Crypto-1, and\n"
-        "  confirms the key on the card — only works on cards vulnerable to the\n"
-        "  darkside attack (hardened/EV1 cards resist it).\n"
-        "• Hardnested: foothold + hardnested solver for cards that resist nested.\n"
-        "• Autopwn → .mfd: recover every sector key and dump the whole card.\n"
-        "Use only on cards you own or are authorized to test.\n\n", -1);
-    gtk_box_append(GTK_BOX(box), scrolled(view));
+    GtkWidget *cv = mono_view(&a->crack_buf,
+        "Mifare key recovery:\n"
+        "• Dictionary — try common/default keys against the block (cmd 13).\n"
+        "• Nested — auto-find a foothold key, recover the target (Crypto-1, ~10–30 s).\n"
+        "• Darkside — collect nonces (cmd 15), solve + confirm (vulnerable cards only).\n"
+        "• Hardnested — foothold + hardnested solver (progress prints to the terminal).\n"
+        "• Autopwn → .mfd — recover every sector key and dump the whole card.\n"
+        "• Load keys… — add a .keys dictionary file.\n\n");
+    a->crack_view = cv;
+    gtk_box_append(GTK_BOX(box), scrolled(cv));
+    return box;
+}
+
+static GtkWidget *page_dump(App *a)
+{
+    GtkWidget *box = page_box();
+
+    gtk_box_append(GTK_BOX(box), section_label("Dump file"));
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "The buffer holds the last card read (HF tab) or loaded here. Save as text "
+        ".pmdump or raw binary .mfd; Load auto-detects either."));
+    GtkWidget *r0 = hrow();
+    gtk_box_append(GTK_BOX(r0), btn("Load…", "suggested-action", G_CALLBACK(on_load), a));
+    gtk_box_append(GTK_BOX(r0), btn("Save .pmdump…", NULL, G_CALLBACK(on_save), a));
+    gtk_box_append(GTK_BOX(r0), btn("Export .mfd…", NULL, G_CALLBACK(on_export), a));
+    gtk_box_append(GTK_BOX(r0), btn("Show buffer", NULL, G_CALLBACK(on_print_buffer), a));
+    gtk_box_append(GTK_BOX(box), r0);
+
+    gtk_box_append(GTK_BOX(box), section_label("Edit / compare"));
+    GtkWidget *r1 = hrow();
+    gtk_box_append(GTK_BOX(r1), gtk_label_new("Block"));
+    a->edit_block = gtk_spin_button_new_with_range(0, PMPRO_MAX_BLOCKS - 1, 1);
+    gtk_box_append(GTK_BOX(r1), a->edit_block);
+    a->edit_hex = entry_exp("new block hex (≤64 bytes)");
+    gtk_box_append(GTK_BOX(r1), a->edit_hex);
+    gtk_box_append(GTK_BOX(r1), btn("Set block", NULL, G_CALLBACK(on_set_block), a));
+    gtk_box_append(GTK_BOX(r1), btn("Diff vs file…", NULL, G_CALLBACK(on_diff), a));
+    gtk_box_append(GTK_BOX(box), r1);
+
+    GtkWidget *dv = mono_view(&a->dump_buf,
+        "Load a .pmdump or .mfd, or read a card on the HF/LF tab, then Show buffer.\n");
+    a->dump_view = dv;
+    gtk_box_append(GTK_BOX(box), scrolled(dv));
+    return box;
+}
+
+static GtkWidget *page_console(App *a)
+{
+    GtkWidget *box = page_box();
+    GtkWidget *cv = mono_view(&a->console_buf,
+        "Raw protocol console. Enter a command PAYLOAD in hex (the app adds framing, "
+        "CRC16 and RC4). Response is shown decrypted.\n"
+        "Examples:  06 (identify)   09 01 02 (beep)   21 (read HF)\n\n");
+    a->console_view = cv;
+    gtk_box_append(GTK_BOX(box), scrolled(cv));
+
+    GtkWidget *row = hrow();
+    a->hex_entry = entry_exp("payload hex, e.g. 21");
+    g_signal_connect(a->hex_entry, "activate", G_CALLBACK(on_send_raw), a);
+    gtk_box_append(GTK_BOX(row), a->hex_entry);
+    gtk_box_append(GTK_BOX(row), btn("Send", "suggested-action", G_CALLBACK(on_send_raw), a));
+    gtk_box_append(GTK_BOX(box), row);
     return box;
 }
 
@@ -1151,12 +1231,11 @@ static void load_css(void)
     g_object_unref(p);
 }
 
-/* persist size + current key entry on close */
 static gboolean on_close_request(GtkWindow *w, gpointer u)
 {
     (void)w;
     settings_save((App *)u);
-    return FALSE;   /* allow the close to proceed */
+    return FALSE;
 }
 
 static void activate(GtkApplication *gapp, gpointer user)
@@ -1166,7 +1245,7 @@ static void activate(GtkApplication *gapp, gpointer user)
     GtkWidget *win = adw_application_window_new(gapp);
     a->win = GTK_WINDOW(win);
     gtk_window_set_title(GTK_WINDOW(win), "NFC PM-Pro");
-    gtk_window_set_default_size(GTK_WINDOW(win), 880, 600);
+    gtk_window_set_default_size(GTK_WINDOW(win), 920, 640);
 
     GtkWidget *toolbar = adw_toolbar_view_new();
     GtkWidget *header = adw_header_bar_new();
@@ -1178,12 +1257,14 @@ static void activate(GtkApplication *gapp, gpointer user)
     GtkWidget *stack = adw_view_stack_new();
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_device(a),
         "device", "Device", "preferences-system-symbolic");
-    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_read(a),
-        "read", "Read", "view-reveal-symbolic");
-    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_write(a),
-        "write", "Write / Clone", "document-edit-symbolic");
+    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_hf(a),
+        "hf", "HF · Mifare", "view-reveal-symbolic");
+    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_lfhid(a),
+        "lfhid", "LF · HID", "network-wireless-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_crack(a),
         "crack", "Crack", "dialog-password-symbolic");
+    adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_dump(a),
+        "dump", "Dump", "document-save-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_console(a),
         "console", "Console", "utilities-terminal-symbolic");
 
@@ -1193,12 +1274,18 @@ static void activate(GtkApplication *gapp, gpointer user)
     adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), sw);
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
 
+    /* a bottom switcher bar too, so all tabs are reachable on narrow windows */
+    GtkWidget *swbar = adw_view_switcher_bar_new();
+    adw_view_switcher_bar_set_stack(ADW_VIEW_SWITCHER_BAR(swbar), ADW_VIEW_STACK(stack));
+    adw_view_switcher_bar_set_reveal(ADW_VIEW_SWITCHER_BAR(swbar), TRUE);
+    adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar), swbar);
+
     a->toasts = ADW_TOAST_OVERLAY(adw_toast_overlay_new());
     adw_toast_overlay_set_child(a->toasts, stack);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), GTK_WIDGET(a->toasts));
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(win), toolbar);
 
-    settings_load(a);   /* restore mute / key / window size / .keys files */
+    settings_load(a);
     g_signal_connect(win, "close-request", G_CALLBACK(on_close_request), a);
     gtk_window_present(GTK_WINDOW(win));
 }
