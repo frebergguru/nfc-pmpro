@@ -1274,12 +1274,6 @@ static void activate(GtkApplication *gapp, gpointer user)
     adw_header_bar_set_title_widget(ADW_HEADER_BAR(header), sw);
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar), header);
 
-    /* a bottom switcher bar too, so all tabs are reachable on narrow windows */
-    GtkWidget *swbar = adw_view_switcher_bar_new();
-    adw_view_switcher_bar_set_stack(ADW_VIEW_SWITCHER_BAR(swbar), ADW_VIEW_STACK(stack));
-    adw_view_switcher_bar_set_reveal(ADW_VIEW_SWITCHER_BAR(swbar), TRUE);
-    adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar), swbar);
-
     a->toasts = ADW_TOAST_OVERLAY(adw_toast_overlay_new());
     adw_toast_overlay_set_child(a->toasts, stack);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar), GTK_WIDGET(a->toasts));
