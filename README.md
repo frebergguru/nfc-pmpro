@@ -12,6 +12,9 @@ software, no Wine needed at runtime.
 - **Read / Write / Clone Mifare sectors** — read sectors with a key, write a
   sector, and clone a buffered card to a blank (auto-restoring the trailer key).
 - **Read / Write LF** (125 kHz, EM4100/T5577/EM4305) and **HID prox** (read/write).
+  LF reads decode the EM4100 customer/card number + fob text.
+- **Save / Load dump** — save a read card to a `.pmdump`, or load one back into
+  the buffer to write to a blank.
 - **Crack** — four Mifare key attacks, plus whole-card autopwn:
   - **Dictionary** (cmd 13) — tries common/default keys; returns the one that
     authenticates. *(verified live)*

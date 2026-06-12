@@ -171,6 +171,12 @@ int main(int argc, char **argv)
         printf("HID read (%zu bytes):", n);
         for (size_t i = 0; i < n; i++) printf(" %02x", buf[i]);
         printf("\n");
+    } else if (!strcmp(cmd, "writehid") && argc > 2) {
+        /* writehid <12-byte card id hex> — write an HID prox card (cmd 2E) */
+        if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        uint8_t id[12];
+        if (pmpro_parse_hex(argv[2], id, sizeof id) != 12) { printf("card id must be 12 bytes\n"); return 2; }
+        printf("write HID: %s\n", furui_write_hid(&dev, id) ? "OK" : "FAILED");
     } else if (!strcmp(cmd, "openfind")) {
         if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
         printf("openfind: %s\n", furui_openfind(&dev) ? "OK" : "FAILED");

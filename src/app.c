@@ -189,14 +189,15 @@ static gpointer w_read_hf(gpointer p)
         if (!a->connected) a->connected = furui_connect(&a->dev);
         furui_hf_card c;
         if (furui_read_hf(&a->dev, &c)) {
-            char uid[64], tail[32];
-            pmpro_hex(c.uid, c.uid_len, uid, sizeof uid);
+            uid_info ui; pmpro_decode_uid(c.uid, c.uid_len, &ui);
+            char tail[32];
             pmpro_hex(c.tail, c.tail_len, tail, sizeof tail);
-            post(a, K_READ, 1, "HF (13.56MHz)  UID: %s   [ATQA/SAK: %s]", uid, tail);
+            post(a, K_READ, 1, "HF (13.56MHz)  UID: %s (%d-byte)   [ATQA/SAK: %s]",
+                 ui.uid, ui.uid_len, tail);
             pmpro_dump_init(&a->last);
             snprintf(a->last.card_type, sizeof a->last.card_type, "ISO14443A");
             snprintf(a->last.frequency, sizeof a->last.frequency, "13.56MHz");
-            snprintf(a->last.uid, sizeof a->last.uid, "%s", uid);
+            snprintf(a->last.uid, sizeof a->last.uid, "%s", ui.uid);
             a->have_last = TRUE;
             /* sector sweep with the chosen key (default FF) */
             char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
@@ -247,6 +248,14 @@ static gpointer w_read_lf(gpointer p)
             snprintf(a->last.frequency, sizeof a->last.frequency, "125kHz");
             snprintf(a->last.uid, sizeof a->last.uid, "%.120s", hex_str(resp + 3, dlen));
             a->have_last = TRUE;
+            em4100_info em;
+            if (pmpro_decode_em4100(resp + 3, dlen, &em)) {
+                post(a, K_READ, 1, "  EM4100: id %s  customer %u  card %u  (fob %s)",
+                     em.hex, em.customer, em.card_number, em.fob_text);
+                snprintf(a->last.meta, sizeof a->last.meta,
+                         "EM4100 id %s customer %u card %u fob %s",
+                         em.hex, em.customer, em.card_number, em.fob_text);
+            }
             post(a, K_TOAST, 1, "LF card read");
             app_beep(a);
         } else {
@@ -548,6 +557,38 @@ static void on_save(GtkButton *b, gpointer u)
     gtk_file_dialog_save(d, a->win, NULL, on_save_finish, a);
 }
 
+static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    char err[128];
+    if (pmpro_dump_load(&a->last, path, err, sizeof err)) {
+        a->have_last = TRUE;
+        post(a, K_READ, 1, "Loaded dump: %s — %s/%s, UID %s, %d block(s)%s%s",
+             path, a->last.card_type, a->last.frequency, a->last.uid,
+             a->last.n_blocks, a->last.meta[0] ? " — " : "", a->last.meta);
+        post(a, K_TOAST, 1, "Dump loaded into buffer");
+    } else {
+        post(a, K_TOAST, 0, "%s", err);
+    }
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_load(GtkButton *b, gpointer u)
+{
+    (void)b;
+    App *a = u;
+    if (g_atomic_int_get(&a->busy)) {
+        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…"));
+        return;
+    }
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_open(d, a->win, NULL, on_load_finish, a);
+}
+
 /* ---- autopwn → .mfd ---------------------------------------------------- */
 
 /* progress hook, called on the worker thread from inside furui_autopwn */
@@ -661,9 +702,14 @@ static GtkWidget *page_read(App *a)
     g_signal_connect(lf, "clicked", G_CALLBACK(on_read_lf), a);
     GtkWidget *save = gtk_button_new_with_label("Save dump…");
     g_signal_connect(save, "clicked", G_CALLBACK(on_save), a);
+    GtkWidget *load = gtk_button_new_with_label("Load dump…");
+    gtk_widget_set_tooltip_text(load, "Load a .pmdump into the buffer, then write "
+                                "it to a blank from the Write / Clone tab");
+    g_signal_connect(load, "clicked", G_CALLBACK(on_load), a);
     gtk_box_append(GTK_BOX(row), hf);
     gtk_box_append(GTK_BOX(row), lf);
     gtk_box_append(GTK_BOX(row), save);
+    gtk_box_append(GTK_BOX(row), load);
     gtk_box_append(GTK_BOX(box), row);
 
     GtkWidget *krow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
