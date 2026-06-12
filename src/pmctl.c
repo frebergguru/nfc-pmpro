@@ -193,8 +193,14 @@ int main(int argc, char **argv)
         if (ok) printf("KEY block %d (key %c): %02x%02x%02x%02x%02x%02x\n", tb, ttype?'B':'A',
                        found[0],found[1],found[2],found[3],found[4],found[5]);
     } else if (!strcmp(cmd, "autopwn")) {
+        /* autopwn [outfile.mfd] [keysfile.keys] */
         if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
         const char *path = argc > 2 ? argv[2] : "card.mfd";
+        if (argc > 3) {
+            char e[128]; int n = furui_keys_load(argv[3], e, sizeof e);
+            if (n < 0) printf("%s\n", e);
+            else printf("loaded %d keys from %s (%d in dictionary)\n", n, argv[3], furui_keys_count());
+        }
         char log[256];
         int ok = furui_autopwn(&dev, path, cli_prog, NULL, log, sizeof log);
         printf("autopwn: %s\n", log);
@@ -213,9 +219,15 @@ int main(int argc, char **argv)
         if (ok) printf("KEY block %d (key %c): %02x%02x%02x%02x%02x%02x\n", tb, ttype?'B':'A',
                        found[0],found[1],found[2],found[3],found[4],found[5]);
     } else if (!strcmp(cmd, "dict")) {
+        /* dict <block> <type> [keysfile.keys] */
         if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
         int block = argc > 2 ? atoi(argv[2]) : 4;
         int type  = argc > 3 ? atoi(argv[3]) : 0;
+        if (argc > 4) {
+            char e[128]; int n = furui_keys_load(argv[4], e, sizeof e);
+            if (n < 0) printf("%s\n", e);
+            else printf("loaded %d keys from %s (%d in dictionary)\n", n, argv[4], furui_keys_count());
+        }
         uint8_t found[6];
         if (furui_dict_attack(&dev, (uint8_t)block, (uint8_t)type, found)) {
             printf("KEY FOUND for block %d (key %c): %02x%02x%02x%02x%02x%02x\n",

@@ -2,9 +2,11 @@
 #include "session.h"
 #include "furui.h"
 #include "crypto1.h"
+#include "protocol.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
 
 /* ---- cmd 13: test a key list, device returns the one that authenticates --- */
 
@@ -46,10 +48,65 @@ static const uint8_t DICT[][6] = {
     {0x11,0x11,0x11,0x11,0x11,0x11}, {0x22,0x22,0x22,0x22,0x22,0x22},
 };
 
+/* ---- session key store (loaded from MifareClassicTool .keys files) ----- */
+
+static uint8_t (*g_keys)[6];     /* dynamically grown user dictionary */
+static int g_nkeys, g_kcap;
+
+int furui_keys_count(void) { return g_nkeys; }
+
+void furui_keys_clear(void)
+{
+    free(g_keys);
+    g_keys = NULL;
+    g_nkeys = g_kcap = 0;
+}
+
+static int add_user_key(const uint8_t k[6])
+{
+    if (g_nkeys == g_kcap) {
+        int nc = g_kcap ? g_kcap * 2 : 256;
+        uint8_t (*p)[6] = realloc(g_keys, (size_t)nc * 6);
+        if (!p) return 0;
+        g_keys = p; g_kcap = nc;
+    }
+    memcpy(g_keys[g_nkeys++], k, 6);
+    return 1;
+}
+
+int furui_keys_load(const char *path, char *err, size_t errcap)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(err, errcap, "cannot open %s", path);
+        return -1;
+    }
+    char line[256];
+    int added = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *s = line;
+        while (*s && isspace((unsigned char)*s)) s++;           /* trim leading */
+        if (*s == '#' || *s == '\0') continue;                  /* comment/blank */
+        size_t L = strlen(s);
+        while (L && isspace((unsigned char)s[L - 1])) s[--L] = '\0'; /* trim trailing */
+        if (L != 12) continue;                  /* a Mifare key is 12 hex chars */
+        uint8_t k[6];
+        if (pmpro_parse_hex(s, k, 6) != 6) continue;
+        if (add_user_key(k)) added++;
+    }
+    fclose(f);
+    if (err && errcap) err[0] = '\0';
+    return added;
+}
+
 int furui_dict_attack(pmpro_dev *dev, uint8_t block, uint8_t type, uint8_t found[6])
 {
-    return furui_check_keys(dev, block, type, DICT,
-                            (int)(sizeof DICT / 6), found);
+    if (furui_check_keys(dev, block, type, DICT, (int)(sizeof DICT / 6), found))
+        return 1;
+    if (g_nkeys &&
+        furui_check_keys(dev, block, type, (const uint8_t (*)[6])g_keys, g_nkeys, found))
+        return 1;
+    return 0;
 }
 
 /* ---- darkside collection (cmd 15) ------------------------------------- */

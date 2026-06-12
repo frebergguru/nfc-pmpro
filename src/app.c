@@ -589,6 +589,37 @@ static void on_load(GtkButton *b, gpointer u)
     gtk_file_dialog_open(d, a->win, NULL, on_load_finish, a);
 }
 
+static void on_load_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    char err[128];
+    int n = furui_keys_load(path, err, sizeof err);
+    if (n >= 0) {
+        post(a, K_CRACK, 1, "Loaded %d key(s) from %s — %d in dictionary now",
+             n, path, furui_keys_count());
+        post(a, K_TOAST, 1, "Loaded %d keys (%d total)", n, furui_keys_count());
+    } else {
+        post(a, K_TOAST, 0, "%s", err);
+    }
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_load_keys(GtkButton *b, gpointer u)
+{
+    (void)b;
+    App *a = u;
+    if (g_atomic_int_get(&a->busy)) {
+        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Busy…"));
+        return;
+    }
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_open(d, a->win, NULL, on_load_keys_finish, a);
+}
+
 /* ---- autopwn → .mfd ---------------------------------------------------- */
 
 /* progress hook, called on the worker thread from inside furui_autopwn */
@@ -865,6 +896,11 @@ static GtkWidget *page_crack(App *a)
     g_signal_connect(autop, "clicked", G_CALLBACK(on_autopwn), a);
     gtk_box_append(GTK_BOX(arow), gtk_label_new("Whole card:"));
     gtk_box_append(GTK_BOX(arow), autop);
+    GtkWidget *lkeys = gtk_button_new_with_label("Load keys…");
+    gtk_widget_set_tooltip_text(lkeys, "Import a MifareClassicTool .keys file; the "
+        "keys extend the dictionary used by Dictionary/Nested/Autopwn");
+    g_signal_connect(lkeys, "clicked", G_CALLBACK(on_load_keys), a);
+    gtk_box_append(GTK_BOX(arow), lkeys);
     gtk_box_append(GTK_BOX(box), arow);
 
     GtkWidget *view = mono_view(&a->crack_buf);

@@ -12,8 +12,20 @@
 int furui_check_keys(pmpro_dev *dev, uint8_t block, uint8_t type,
                      const uint8_t (*keys)[6], int n, uint8_t found[6]);
 
-/* Built-in dictionary attack on `block`. Returns 1 + found[6] on success. */
+/* Built-in dictionary attack on `block` — tries the built-in keys plus any keys
+ * loaded via furui_keys_load. Returns 1 + found[6] on success. */
 int furui_dict_attack(pmpro_dev *dev, uint8_t block, uint8_t type, uint8_t found[6]);
+
+/* Load Mifare keys from a MifareClassicTool-style .keys file (one 12-hex-char
+ * key per line; '#' comments and blank lines ignored) into the session key
+ * store, which furui_dict_attack appends to the built-in dictionary. Keys
+ * accumulate across calls. Returns the number of keys added, or -1 on error
+ * (err, size errcap, gets the reason). */
+int furui_keys_load(const char *path, char *err, size_t errcap);
+
+/* Number of keys currently in the session store, and a reset. */
+int  furui_keys_count(void);
+void furui_keys_clear(void);
 
 /* Collect darkside nonce data (cmd 10 + cmd 15) for `block`/`type` into `out`.
  * Returns the collected payload length (0/short => card not vulnerable). */

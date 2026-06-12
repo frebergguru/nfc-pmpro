@@ -15,6 +15,9 @@ software, no Wine needed at runtime.
   LF reads decode the EM4100 customer/card number + fob text.
 - **Save / Load dump** — save a read card to a `.pmdump`, or load one back into
   the buffer to write to a blank.
+- **Import .keys** — load MifareClassicTool-style `.keys` dictionaries (GUI
+  Crack tab "Load keys…", or `pmctl dict <blk> <type> <file>`); the keys extend
+  the dictionary used by Dictionary/Nested/Autopwn.
 - **Crack** — four Mifare key attacks, plus whole-card autopwn:
   - **Dictionary** (cmd 13) — tries common/default keys; returns the one that
     authenticates. *(verified live)*
