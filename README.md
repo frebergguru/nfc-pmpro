@@ -47,6 +47,10 @@ software, no Wine needed at runtime.
     sectors keyed and read)*
 - **Format** a sector, **beep** (with a mute toggle), **find/scan** (openfind),
   raw **console** (send a payload; see the decrypted reply).
+- **Card insight** — card-type detection (SAK/ATQA), decoded access conditions
+  and value blocks (shown inline), and a per-sector **Key map** grid.
+- **Auto-read** — optionally poll and read a card automatically when placed.
+- **Write confirmations** — destructive writes ask before touching a card.
 
 The GUI is organised into tabs — **Device · HF · Mifare · LF · HID · Crack ·
 Dump · Console** — each with its own log so an action's output appears next to
@@ -69,6 +73,10 @@ cmake -G Ninja -S . -B build && ninja -C build
 ./build/pmpro           # GUI
 ./build/pmctl connect   # CLI: connect+beep
 ./build/pmctl readic    # CLI: read a 13.56 MHz card
+```
+Install it as a desktop app (adds a launcher + icon):
+```sh
+cmake -G Ninja -S . -B build -DCMAKE_INSTALL_PREFIX=/usr && sudo ninja -C build install
 ```
 
 ## Device access (one-time)
