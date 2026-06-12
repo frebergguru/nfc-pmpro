@@ -746,10 +746,61 @@ static int hf_write(App *a, int s, const uint8_t out[64])
     return TW_DENIED;
 }
 
+static const uint8_t KEY_FF6[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+/* after a reset: can we read the sector with FF, and is it zeroed + default? */
+static int format_ok(App *a, int s)
+{
+    uint8_t cur[64];
+    furui_activate(&a->dev);
+    if (furui_read_sector(&a->dev, (uint8_t)s, 1, KEY_FF6, NULL, cur, 64) < 64) return 0;
+    int start = (s == 0) ? 16 : 0;                 /* sector 0 block 0 preserved */
+    for (int i = start; i < 48; i++) if (cur[i]) return 0;
+    return memcmp(cur + 54, ACC_DEFAULT, 4) == 0;
+}
+
+/* Factory-reset sector s. Tries cmd18 (zero data + FF trailer) and the device's
+ * native cmd16 format, with the read key, a dictionary Key B, then a nested-
+ * recovered Key B. cmd16 is the only hope for sector 0 (block 0 is read-only, so
+ * a whole-sector cmd18 write is rejected). Returns TW_OK / TW_DENIED / TW_NOKEY. */
+static int hf_format_sector(App *a, int s, const uint8_t out[64])
+{
+    uint8_t key[6]; int type;
+    if (!hf_find_key(a, s, key, &type)) return TW_NOKEY;
+
+    /* read key: try raw write, then device format */
+    furui_activate(&a->dev);
+    furui_write_sector(&a->dev, (uint8_t)s, type ? 2 : 1, type ? NULL : key, type ? key : NULL, out, 64);
+    if (hf_verify(a, s, out)) return TW_OK;
+    furui_activate(&a->dev);
+    furui_format_sector(&a->dev, (uint8_t)s, type ? 2 : 1, type ? NULL : key, type ? key : NULL);
+    if (format_ok(a, s)) return TW_OK;
+
+    uint8_t kb[6];
+    for (int pass = 0; pass < 2; pass++) {
+        int have;
+        if (pass == 0) {
+            have = furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, kb);
+        } else {
+            char log[256];
+            post(a, K_HF, 1, "  sector %d: recovering Key B via nested (slow)…", s);
+            have = furui_nested_auto(&a->dev, (uint8_t)(s * 4), 1, kb, log, sizeof log);
+            if (have) furui_keys_add(kb);
+        }
+        if (!have) continue;
+        if (hf_try_keyb(a, s, out, kb)) return TW_OK;       /* cmd18 with Key B */
+        furui_activate(&a->dev);
+        furui_format_sector(&a->dev, (uint8_t)s, 2, NULL, kb);   /* cmd16 with Key B */
+        if (format_ok(a, s)) return TW_OK;
+    }
+    return TW_DENIED;
+}
+
 static void tw_report(App *a, int s, int r, const char *okmsg)
 {
     if (r == TW_OK)          post(a, K_HF, 1, "  sector %d %s", s, okmsg);
-    else if (r == TW_DENIED) post(a, K_HF, 0, "  sector %d: trailer write denied — Key B not recoverable (hardened sector)", s);
+    else if (r == TW_DENIED) post(a, K_HF, 0, "  sector %d: write rejected — Key B not usable%s", s,
+                                  s == 0 ? " (sector 0 block 0 is read-only on a normal card — needs a magic card)" : "");
     else                     post(a, K_HF, 0, "  sector %d: no key found", s);
 }
 
@@ -770,7 +821,7 @@ static gpointer w_format_all(gpointer p)
             memset(out + 48, 0xFF, 6);           /* keyA -> FF */
             memcpy(out + 54, ACC_DEFAULT, 4);
             memset(out + 58, 0xFF, 6);           /* keyB -> FF */
-            int r = hf_write(a, s, out);
+            int r = hf_format_sector(a, s, out);
             tw_report(a, s, r, "formatted (keys -> FF)");
             if (r == TW_OK) done++; else if (r == TW_DENIED) needB++;
         }
