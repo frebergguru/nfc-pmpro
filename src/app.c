@@ -95,6 +95,7 @@ static void buf_add_tags(GtkTextBuffer *b)
     gtk_text_buffer_create_tag(b, "acs",  "foreground", "#e01b24", NULL); /* ACs — red */
     gtk_text_buffer_create_tag(b, "keyB", "foreground", "#3584e4",
                                "weight", PANGO_WEIGHT_BOLD, NULL);   /* key B — blue */
+    gtk_text_buffer_create_tag(b, "value", "foreground", "#f5c211", NULL); /* value block — yellow */
     gtk_text_buffer_create_tag(b, "diffA", "foreground", "#2ec27e", NULL); /* dump A — green */
     gtk_text_buffer_create_tag(b, "diffB", "foreground", "#e01b24", NULL); /* dump B — red */
 }
@@ -165,6 +166,17 @@ static void append_view(GtkTextBuffer *buf, GtkWidget *view, const char *t)
         gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(view), m);
 }
 
+/* A Mifare value block is value(4) ~value(4) value(4) addr ~addr addr ~addr. */
+static int is_value_block(const uint8_t *b)
+{
+    if (memcmp(b, b + 8, 4) != 0) return 0;
+    for (int i = 0; i < 4; i++)
+        if ((uint8_t)~b[i] != b[4 + i]) return 0;
+    if (b[12] != b[14] || b[13] != b[15]) return 0;
+    if ((uint8_t)~b[12] != b[13]) return 0;
+    return 1;
+}
+
 /* Render a sector MCT-style: "Sector: N" header, one line per 16-byte block,
  * coloured (UID/keyA/ACs/keyB), and a blank line after. */
 static void append_sector(GtkTextBuffer *buf, GtkWidget *view, int sec,
@@ -194,6 +206,8 @@ static void append_sector(GtkTextBuffer *buf, GtkWidget *view, int sec,
                 tag_range(buf, hs, 0,        5 * 3 + 2,  "keyA");
                 tag_range(buf, hs, 6 * 3,    9 * 3 + 2,  "acs");
                 tag_range(buf, hs, 10 * 3,   15 * 3 + 2, "keyB");
+            } else if (is_value_block(d + b * 16)) {   /* value block — yellow */
+                tag_range(buf, hs, 0, 15 * 3 + 2, "value");
             }
         }
     }
