@@ -609,12 +609,37 @@ static void on_save_finish(GObject *src, GAsyncResult *res, gpointer u)
     if (!f) return;
     char *path = g_file_get_path(f);
     char err[128];
-    if (a->have_last && pmpro_dump_save(&a->last, path, err, sizeof err))
+    if (a->have_last && pmpro_dump_save_auto(&a->last, path, err, sizeof err))
         adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Saved dump"));
     else
         adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Nothing to save / error"));
     g_free(path);
     g_object_unref(f);
+}
+
+static void on_export_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    char err[128];
+    if (a->have_last && pmpro_dump_save_mfd(&a->last, path, err, sizeof err))
+        adw_toast_overlay_add_toast(a->toasts, adw_toast_new("Exported .mfd"));
+    else
+        adw_toast_overlay_add_toast(a->toasts,
+            adw_toast_new(a->have_last ? "Export failed" : "Nothing to export — read/load a card first"));
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_export(GtkButton *b, gpointer u)
+{
+    (void)b;
+    App *a = u;
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_initial_name(d, "card.mfd");
+    gtk_file_dialog_save(d, a->win, NULL, on_export_finish, a);
 }
 
 static void on_save(GtkButton *b, gpointer u)
@@ -898,13 +923,18 @@ static GtkWidget *page_read(App *a)
     GtkWidget *save = gtk_button_new_with_label("Save dump…");
     g_signal_connect(save, "clicked", G_CALLBACK(on_save), a);
     GtkWidget *load = gtk_button_new_with_label("Load dump…");
-    gtk_widget_set_tooltip_text(load, "Load a .pmdump into the buffer, then write "
-                                "it to a blank from the Write / Clone tab");
+    gtk_widget_set_tooltip_text(load, "Load a .pmdump or raw .mfd into the buffer, "
+                                "then write it to a blank from the Write / Clone tab");
     g_signal_connect(load, "clicked", G_CALLBACK(on_load), a);
+    GtkWidget *expo = gtk_button_new_with_label("Export .mfd…");
+    gtk_widget_set_tooltip_text(expo, "Export the buffer as a raw binary Mifare "
+                                ".mfd dump (libnfc/Proxmark compatible)");
+    g_signal_connect(expo, "clicked", G_CALLBACK(on_export), a);
     gtk_box_append(GTK_BOX(row), hf);
     gtk_box_append(GTK_BOX(row), lf);
     gtk_box_append(GTK_BOX(row), save);
     gtk_box_append(GTK_BOX(row), load);
+    gtk_box_append(GTK_BOX(row), expo);
     gtk_box_append(GTK_BOX(box), row);
 
     GtkWidget *krow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);

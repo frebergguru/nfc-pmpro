@@ -43,8 +43,16 @@ int main(int argc, char **argv)
         if (!pmpro_dump_load(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
         int idx = atoi(argv[3]);
         if (!pmpro_dump_set_block(&d, idx, argv[4])) { printf("set failed (bad index %d or hex)\n", idx); return 2; }
-        if (!pmpro_dump_save(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
+        if (!pmpro_dump_save_auto(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
         printf("block %d set; saved %s\n", idx, argv[2]);
+        return 0;
+    }
+    if (!strcmp(cmd, "dumpconv") && argc > 3) {
+        /* convert between formats by extension: <in> <out>  (.mfd <-> .pmdump) */
+        static pmpro_dump d; char e[128];
+        if (!pmpro_dump_load(&d, argv[2], e, sizeof e)) { printf("%s\n", e); return 2; }
+        if (!pmpro_dump_save_auto(&d, argv[3], e, sizeof e)) { printf("%s\n", e); return 2; }
+        printf("converted %s -> %s (%d sectors)\n", argv[2], argv[3], d.n_blocks);
         return 0;
     }
 

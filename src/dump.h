@@ -45,6 +45,15 @@ int pmpro_dump_diff(const pmpro_dump *a, const pmpro_dump *b, char *out, size_t 
 
 /* Returns true on success; on failure fills err (size n). */
 bool pmpro_dump_save(const pmpro_dump *d, const char *path, char *err, size_t n);
+
+/* Save as a raw binary Mifare dump (.mfd): each sector entry's bytes written
+ * contiguously, padded up to the nearest standard card size (1K/4K). */
+bool pmpro_dump_save_mfd(const pmpro_dump *d, const char *path, char *err, size_t n);
+
+/* Save dispatching on the path's extension: ".mfd" -> raw binary, else text. */
+bool pmpro_dump_save_auto(const pmpro_dump *d, const char *path, char *err, size_t n);
+
+/* Load auto-detecting text .pmdump vs raw binary .mfd. */
 bool pmpro_dump_load(pmpro_dump *d, const char *path, char *err, size_t n);
 
 #endif /* PMPRO_DUMP_H */

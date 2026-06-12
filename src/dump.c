@@ -88,6 +88,58 @@ bool pmpro_dump_save(const pmpro_dump *d, const char *path, char *err, size_t n)
     return true;
 }
 
+bool pmpro_dump_save_mfd(const pmpro_dump *d, const char *path, char *err, size_t n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        snprintf(err, n, "cannot write %s", path);
+        return false;
+    }
+    /* each entry is one sector (sectors 0..31 = 64 bytes, 4K sectors = 256);
+     * parse its hex, zero-pad short/missing data, write contiguously. */
+    size_t total = 0;
+    for (int i = 0; i < d->n_blocks; i++) {
+        int secsize = i < 32 ? 64 : 256;
+        unsigned char raw[256];
+        memset(raw, 0, sizeof raw);
+        pmpro_parse_hex(d->blocks[i], raw, (size_t)secsize);
+        fwrite(raw, 1, (size_t)secsize, f);
+        total += (size_t)secsize;
+    }
+    /* pad up to a standard card size so the result is a valid .mfd */
+    size_t target = total <= 1024 ? 1024 : 4096;
+    unsigned char z[64] = {0};
+    while (total < target) {
+        size_t c = target - total < sizeof z ? target - total : sizeof z;
+        fwrite(z, 1, c, f);
+        total += c;
+    }
+    fclose(f);
+    if (err && n) err[0] = '\0';
+    return true;
+}
+
+static int has_ext(const char *path, const char *ext)
+{
+    size_t lp = strlen(path), le = strlen(ext);
+    if (lp < le) return 0;
+    const char *p = path + lp - le;
+    for (size_t i = 0; i < le; i++) {
+        char a = p[i], b = ext[i];
+        if (a >= 'A' && a <= 'Z') a += 32;
+        if (b >= 'A' && b <= 'Z') b += 32;
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+bool pmpro_dump_save_auto(const pmpro_dump *d, const char *path, char *err, size_t n)
+{
+    if (has_ext(path, ".mfd") || has_ext(path, ".bin") || has_ext(path, ".dump"))
+        return pmpro_dump_save_mfd(d, path, err, n);
+    return pmpro_dump_save(d, path, err, n);
+}
+
 static void rstrip(char *s)
 {
     size_t len = strlen(s);
