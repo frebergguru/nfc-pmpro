@@ -698,20 +698,35 @@ static int hf_read(App *a, int s, uint8_t cur[64], uint8_t key[6], int *type)
                              *type ? NULL : key, *type ? key : NULL, cur, 64) >= 64;
 }
 
-/* write out[64] to sector s, trying the read key then a dictionary Key B
- * (trailer writes usually need Key B). Returns TW_OK / TW_DENIED / TW_NOKEY. */
+/* read sector s back and check the data blocks + access bits match `out`.
+ * (keyA/keyB aren't readable, but the access bytes prove the trailer was
+ * actually rewritten — the device ACKs writes the card silently rejected.) */
+static int hf_verify(App *a, int s, const uint8_t out[64])
+{
+    uint8_t cur[64], key[6]; int type;
+    if (!hf_read(a, s, cur, key, &type)) return 0;
+    int start = (s == 0) ? 16 : 0;                   /* sector 0 block 0 is preserved */
+    if (memcmp(cur + start, out + start, 48 - start) != 0) return 0;   /* data blocks */
+    if (memcmp(cur + 54, out + 54, 4) != 0) return 0;                  /* access bits */
+    return 1;
+}
+
+/* write out[64] to sector s, verifying by read-back; if the read key couldn't
+ * change the trailer, retry with a dictionary Key B. TW_OK / TW_DENIED / TW_NOKEY. */
 enum { TW_OK, TW_DENIED, TW_NOKEY };
 static int hf_write(App *a, int s, const uint8_t out[64])
 {
     uint8_t key[6]; int type;
     if (!hf_find_key(a, s, key, &type)) return TW_NOKEY;
     furui_activate(&a->dev);
-    if (furui_write_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
-                           type ? NULL : key, type ? key : NULL, out, 64)) return TW_OK;
-    uint8_t kb[6];               /* read key couldn't write the trailer — try Key B */
+    furui_write_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
+                       type ? NULL : key, type ? key : NULL, out, 64);
+    if (hf_verify(a, s, out)) return TW_OK;
+    uint8_t kb[6];               /* the write didn't take — the trailer needs Key B */
     if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, kb)) {
         furui_activate(&a->dev);
-        if (furui_write_sector(&a->dev, (uint8_t)s, 2, NULL, kb, out, 64)) return TW_OK;
+        furui_write_sector(&a->dev, (uint8_t)s, 2, NULL, kb, out, 64);
+        if (hf_verify(a, s, out)) return TW_OK;
     }
     return TW_DENIED;
 }
