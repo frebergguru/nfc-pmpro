@@ -18,8 +18,8 @@ blank, and whole-card tag operations:
 | ![Device tab](Screenshots/device.png) | ![Crack tab](Screenshots/crack.png) |
 | **LF · HID** — 125 kHz EM4100/T5577 + HID prox | **Dump** — load/save/export, hex editor, diff |
 | ![LF · HID tab](Screenshots/lf-hid.png) | ![Dump tab](Screenshots/dump.png) |
-| **Console** — send raw protocol payloads | |
-| ![Console tab](Screenshots/console.png) | |
+| **Records** — build/read NDEF (Text, URL, contact, …) | **Console** — send raw protocol payloads |
+| ![Records tab](Screenshots/records.png) | ![Console tab](Screenshots/console.png) |
 
 ## What works (all verified on real hardware unless noted)
 - **Connect** — identify + RC4 handshake.
