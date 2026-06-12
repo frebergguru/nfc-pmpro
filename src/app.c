@@ -76,7 +76,11 @@ typedef struct {
 
 enum { K_STATUS, K_TOAST, K_INFO, K_HF, K_LFHID, K_CRACK, K_DUMP, K_CONSOLE };
 
-typedef struct { App *a; int kind; int ok; char text[1024]; } UiMsg;
+typedef struct {
+    App *a; int kind; int ok; char text[1024];
+    int is_sector;            /* render sdata as an MCT-style sector block */
+    int sector; uint8_t sdata[256]; int sdlen;
+} UiMsg;
 
 /* colour tags, matching MifareClassicTool's scheme so dumps look familiar:
  * UID/manufacturer block = orange, Key A = green, ACs = red, Key B = blue.
@@ -161,6 +165,47 @@ static void append_view(GtkTextBuffer *buf, GtkWidget *view, const char *t)
         gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(view), m);
 }
 
+/* Render a sector MCT-style: "Sector: N" header, one line per 16-byte block,
+ * coloured (UID/keyA/ACs/keyB), and a blank line after. */
+static void append_sector(GtkTextBuffer *buf, GtkWidget *view, int sec,
+                          const uint8_t *d, int n)
+{
+    int has_tags = gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buf), "keyA") != NULL;
+    GtkTextIter end;
+    char line[64];
+    snprintf(line, sizeof line, "Sector: %d\n", sec);
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_insert(buf, &end, line, -1);
+
+    int nblocks = n / 16;
+    for (int b = 0; b < nblocks; b++) {
+        char hex[64];
+        pmpro_hex(d + b * 16, 16, hex, sizeof hex);
+        gtk_text_buffer_get_end_iter(buf, &end);
+        int base = gtk_text_iter_get_offset(&end);
+        gtk_text_buffer_insert(buf, &end, "  ", -1);
+        gtk_text_buffer_insert(buf, &end, hex, -1);
+        gtk_text_buffer_insert(buf, &end, "\n", -1);
+        if (has_tags) {
+            int hs = base + 2;                 /* hex starts after the "  " indent */
+            if (sec == 0 && b == 0) {
+                tag_range(buf, hs, 0, 15 * 3 + 2, "uid");
+            } else if (b == nblocks - 1) {     /* sector trailer */
+                tag_range(buf, hs, 0,        5 * 3 + 2,  "keyA");
+                tag_range(buf, hs, 6 * 3,    9 * 3 + 2,  "acs");
+                tag_range(buf, hs, 10 * 3,   15 * 3 + 2, "keyB");
+            }
+        }
+    }
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);   /* blank line between sectors */
+    GtkTextMark *m = gtk_text_buffer_get_insert(buf);
+    gtk_text_buffer_get_end_iter(buf, &end);
+    gtk_text_buffer_move_mark(buf, m, &end);
+    if (view)
+        gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(view), m);
+}
+
 static void set_status(App *a, gboolean ok, const char *text)
 {
     gtk_label_set_text(GTK_LABEL(a->status_pill), text);
@@ -177,10 +222,16 @@ static gboolean ui_apply(gpointer p)
     case K_STATUS:  set_status(a, m->ok, m->text); break;
     case K_TOAST:   adw_toast_overlay_add_toast(a->toasts, adw_toast_new(m->text)); break;
     case K_INFO:    gtk_label_set_text(GTK_LABEL(a->info_label), m->text); break;
-    case K_HF:      append_view(a->hf_buf, a->hf_view, m->text); break;
+    case K_HF:
+        if (m->is_sector) append_sector(a->hf_buf, a->hf_view, m->sector, m->sdata, m->sdlen);
+        else append_view(a->hf_buf, a->hf_view, m->text);
+        break;
     case K_LFHID:   append_view(a->lfhid_buf, a->lfhid_view, m->text); break;
     case K_CRACK:   append_view(a->crack_buf, a->crack_view, m->text); break;
-    case K_DUMP:    append_view(a->dump_buf, a->dump_view, m->text); break;
+    case K_DUMP:
+        if (m->is_sector) append_sector(a->dump_buf, a->dump_view, m->sector, m->sdata, m->sdlen);
+        else append_view(a->dump_buf, a->dump_view, m->text);
+        break;
     case K_CONSOLE: append_view(a->console_buf, a->console_view, m->text); break;
     }
     g_free(m);
@@ -200,6 +251,17 @@ static void post(App *a, int kind, int ok, const char *fmt, ...)
 static void toast(App *a, const char *t)
 {
     adw_toast_overlay_add_toast(a->toasts, adw_toast_new(t));
+}
+
+/* queue a sector for MCT-style rendering on the main thread (kind = K_HF/K_DUMP) */
+static void post_sector(App *a, int kind, int sector, const uint8_t *d, int n)
+{
+    UiMsg *m = g_new0(UiMsg, 1);
+    m->a = a; m->kind = kind; m->is_sector = 1; m->sector = sector;
+    if (n > 256) n = 256;
+    memcpy(m->sdata, d, n);
+    m->sdlen = n;
+    g_idle_add(ui_apply, m);
 }
 
 /* ---- device helpers (run on worker thread, hold a->lock) --------------- */
@@ -307,22 +369,42 @@ static gpointer w_read_hf(gpointer p)
             char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
             int open_sectors = 0;
             for (int s = 0; s < 16; s++) {
+                uint8_t blk[64], usekey[6];
+                int usetype = -1;          /* -1 none, 0 key A, 1 key B */
+                /* 1) the key in the box, as key A */
                 furui_activate(&a->dev);
-                uint8_t blk[64];
-                size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL,
-                                              blk, sizeof blk);
-                if (bl >= 64) {
+                size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL, blk, sizeof blk);
+                if (bl >= 64) { memcpy(usekey, a->cur_key, 6); usetype = 0; }
+                /* 2) else the dictionary (built-in + loaded .keys + dump keys) */
+                if (usetype < 0) {
+                    uint8_t fk[6];
+                    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 0, fk)) {
+                        furui_activate(&a->dev);
+                        bl = furui_read_sector(&a->dev, (uint8_t)s, 1, fk, NULL, blk, sizeof blk);
+                        if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 0; }
+                    }
+                    if (usetype < 0 && furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, fk)) {
+                        furui_activate(&a->dev);
+                        bl = furui_read_sector(&a->dev, (uint8_t)s, 2, NULL, fk, blk, sizeof blk);
+                        if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 1; }
+                    }
+                }
+                if (usetype >= 0) {
                     open_sectors++;
+                    /* device masks keyA on read — restore the key we authenticated with */
+                    if (usetype == 0) memcpy(blk + 48, usekey, 6);
+                    else              memcpy(blk + 58, usekey, 6);
                     char h[200]; pmpro_hex(blk, 64, h, sizeof h);
-                    post(a, K_HF, 1, "  sector %2d (key %s): %s", s, kh, h);
                     pmpro_dump_add_block(&a->last, h);
+                    post_sector(a, K_HF, s, blk, 64);
                 }
             }
             if (!open_sectors)
-                post(a, K_HF, 0, "  no sectors readable with key %s "
-                     "(use Crack to recover keys, or it's hardened)", kh);
+                post(a, K_HF, 0, "no sectors readable (tried key %s + dictionary). "
+                     "Recover keys on the Crack tab, load a .keys file, or import "
+                     "a dump's keys.", kh);
             else
-                post(a, K_HF, 1, "  %d/16 sectors → buffer (Clone below, or the Dump tab)",
+                post(a, K_HF, 1, "%d/16 sectors → buffer (Clone, or the Dump tab)",
                      open_sectors);
             post(a, K_TOAST, 1, "HF card read");
             app_beep(a);
@@ -791,8 +873,30 @@ static void on_print_buffer(GtkButton *b, gpointer u)
     post(a, K_DUMP, 1, "Buffer: %s / %s, UID %s, %d sector(s)%s%s",
          a->last.card_type, a->last.frequency, a->last.uid, a->last.n_blocks,
          a->last.meta[0] ? " — " : "", a->last.meta);
-    for (int i = 0; i < a->last.n_blocks; i++)
-        post(a, K_DUMP, 1, "  [%2d] %s", i, a->last.blocks[i]);
+    for (int i = 0; i < a->last.n_blocks; i++) {
+        uint8_t d[256];
+        int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
+        if (n > 0) post_sector(a, K_DUMP, i, d, n);
+    }
+}
+
+static void on_keys_from_dump(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last || a->last.n_blocks == 0) { toast(a, "Buffer empty — load a dump first"); return; }
+    static const uint8_t zero[6] = {0};
+    int added = 0;
+    for (int i = 0; i < a->last.n_blocks; i++) {
+        uint8_t d[256];
+        int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
+        if (n < 16) continue;
+        int tr = ((n / 16) - 1) * 16;     /* trailer = last block of the sector */
+        if (memcmp(d + tr, zero, 6))      { furui_keys_add(d + tr); added++; }       /* key A */
+        if (memcmp(d + tr + 10, zero, 6)) { furui_keys_add(d + tr + 10); added++; }  /* key B */
+    }
+    post(a, K_DUMP, 1, "Added %d key(s) from the buffer to the dictionary (%d total). "
+         "Read HF will now try them.", added, furui_keys_count());
+    post(a, K_TOAST, 1, "Added %d keys to dictionary", added);
 }
 
 static void on_set_block(GtkButton *b, gpointer u)
@@ -1254,6 +1358,10 @@ static GtkWidget *page_dump(App *a)
     gtk_box_append(GTK_BOX(r0), btn("Save .pmdump…", NULL, G_CALLBACK(on_save), a));
     gtk_box_append(GTK_BOX(r0), btn("Export .mfd…", NULL, G_CALLBACK(on_export), a));
     gtk_box_append(GTK_BOX(r0), btn("Show buffer", NULL, G_CALLBACK(on_print_buffer), a));
+    GtkWidget *k2d = btn("Keys → dict", NULL, G_CALLBACK(on_keys_from_dump), a);
+    gtk_widget_set_tooltip_text(k2d, "Add this dump's trailer keys to the dictionary "
+        "so Read HF (and the Crack tab) can use them");
+    gtk_box_append(GTK_BOX(r0), k2d);
     gtk_box_append(GTK_BOX(box), r0);
 
     gtk_box_append(GTK_BOX(box), section_label("Edit / compare"));

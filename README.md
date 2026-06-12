@@ -7,8 +7,11 @@ software, no Wine needed at runtime.
 
 ## What works (all verified on real hardware unless noted)
 - **Connect** — identify + RC4 handshake.
-- **Read HF** (13.56 MHz, ISO14443A) — UID/type, and a per-sector dump with a
-  chosen key.
+- **Read HF** (13.56 MHz, ISO14443A) — UID/type, and a per-sector dump. Each
+  sector is read with the key in the box, falling back to the dictionary
+  (built-in + loaded `.keys` + keys imported from a dump). Output is rendered
+  MifareClassicTool-style: one block per line, sectors spaced apart, with the
+  UID/manufacturer block, Key A, access bits and Key B colour-coded.
 - **Read / Write / Clone Mifare sectors** — read sectors with a key, write a
   sector, and clone a buffered card to a blank (auto-restoring the trailer key).
 - **Read / Write LF** (125 kHz, EM4100/T5577/EM4305) and **HID prox** (read/write).

@@ -23,6 +23,9 @@ int furui_dict_attack(pmpro_dev *dev, uint8_t block, uint8_t type, uint8_t found
  * (err, size errcap, gets the reason). */
 int furui_keys_load(const char *path, char *err, size_t errcap);
 
+/* Add a single 6-byte key to the session store (e.g. extracted from a dump). */
+void furui_keys_add(const uint8_t key[6]);
+
 /* Number of keys currently in the session store, and a reset. */
 int  furui_keys_count(void);
 void furui_keys_clear(void);

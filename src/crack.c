@@ -74,6 +74,8 @@ static int add_user_key(const uint8_t k[6])
     return 1;
 }
 
+void furui_keys_add(const uint8_t key[6]) { add_user_key(key); }
+
 int furui_keys_load(const char *path, char *err, size_t errcap)
 {
     FILE *f = fopen(path, "r");
