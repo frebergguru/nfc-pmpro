@@ -689,24 +689,63 @@ static int hf_find_key(App *a, int s, uint8_t key[6], int *type)
     return 0;
 }
 
+/* read sector s into cur[64] with a working key (sets key/type). returns 1 ok */
+static int hf_read(App *a, int s, uint8_t cur[64], uint8_t key[6], int *type)
+{
+    if (!hf_find_key(a, s, key, type)) return 0;
+    furui_activate(&a->dev);
+    return furui_read_sector(&a->dev, (uint8_t)s, *type ? 2 : 1,
+                             *type ? NULL : key, *type ? key : NULL, cur, 64) >= 64;
+}
+
+/* write out[64] to sector s, trying the read key then a dictionary Key B
+ * (trailer writes usually need Key B). Returns TW_OK / TW_DENIED / TW_NOKEY. */
+enum { TW_OK, TW_DENIED, TW_NOKEY };
+static int hf_write(App *a, int s, const uint8_t out[64])
+{
+    uint8_t key[6]; int type;
+    if (!hf_find_key(a, s, key, &type)) return TW_NOKEY;
+    furui_activate(&a->dev);
+    if (furui_write_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
+                           type ? NULL : key, type ? key : NULL, out, 64)) return TW_OK;
+    uint8_t kb[6];               /* read key couldn't write the trailer — try Key B */
+    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, kb)) {
+        furui_activate(&a->dev);
+        if (furui_write_sector(&a->dev, (uint8_t)s, 2, NULL, kb, out, 64)) return TW_OK;
+    }
+    return TW_DENIED;
+}
+
+static void tw_report(App *a, int s, int r, const char *okmsg)
+{
+    if (r == TW_OK)          post(a, K_HF, 1, "  sector %d %s", s, okmsg);
+    else if (r == TW_DENIED) post(a, K_HF, 0, "  sector %d: trailer write denied — needs Key B (recover via Crack → Nested)", s);
+    else                     post(a, K_HF, 0, "  sector %d: no key found", s);
+}
+
 static gpointer w_format_all(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
     if (ensure_ready(a)) {
         post(a, K_HF, 1, "Format memory: resetting every sector to defaults…");
-        int done = 0;
+        int done = 0, needB = 0;
         for (int s = 0; s < 16; s++) {
-            uint8_t key[6]; int type;
-            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
-            furui_activate(&a->dev);
-            int ok = furui_format_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
-                                         type ? NULL : key, type ? key : NULL);
-            post(a, K_HF, ok, ok ? "  sector %d formatted" : "  sector %d format FAILED", s);
-            if (ok) done++;
+            uint8_t out[64];
+            memset(out, 0, 48);
+            if (s == 0) {                        /* keep the UID/manufacturer block */
+                uint8_t cur[64], key[6]; int type;
+                if (hf_read(a, 0, cur, key, &type)) memcpy(out, cur, 16);
+            }
+            memset(out + 48, 0xFF, 6);           /* keyA -> FF */
+            memcpy(out + 54, ACC_DEFAULT, 4);
+            memset(out + 58, 0xFF, 6);           /* keyB -> FF */
+            int r = hf_write(a, s, out);
+            tw_report(a, s, r, "formatted (keys -> FF)");
+            if (r == TW_OK) done++; else if (r == TW_DENIED) needB++;
         }
-        post(a, K_TOAST, done > 0, "Formatted %d/16 sectors", done);
-        if (done) app_beep(a);
+        post(a, K_TOAST, done > 0, "Formatted %d/16 sectors%s", done, needB ? " - some need Key B" : "");
+        if (done) { furui_keys_add((const uint8_t[6]){0xFF,0xFF,0xFF,0xFF,0xFF,0xFF}); app_beep(a); }
     }
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
 }
@@ -717,28 +756,21 @@ static gpointer w_erase(gpointer p)
     g_mutex_lock(&a->lock);
     if (ensure_ready(a)) {
         post(a, K_HF, 1, "Erase: zeroing data blocks (keeping the card usable)…");
-        int done = 0;
+        int done = 0, needB = 0;
         for (int s = 0; s < 16; s++) {
-            uint8_t key[6]; int type, flag;
-            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
-            flag = type ? 2 : 1;
-            uint8_t blk[64];
-            furui_activate(&a->dev);
-            if (furui_read_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, blk, sizeof blk) < 64) {
-                post(a, K_HF, 0, "  sector %d read FAILED", s); continue;
-            }
+            uint8_t cur[64], key[6]; int type;
+            if (!hf_read(a, s, cur, key, &type)) { post(a, K_HF, 0, "  sector %d: no key found", s); continue; }
             uint8_t out[64];
             memset(out, 0, 48);
-            if (s == 0) memcpy(out, blk, 16);            /* keep manufacturer block */
-            memcpy(out + 48, key, 6);                    /* keyA = working key */
+            if (s == 0) memcpy(out, cur, 16);            /* keep manufacturer block */
+            memcpy(out + 48, key, 6);                    /* keep the working key */
             memcpy(out + 54, ACC_DEFAULT, 4);
-            memcpy(out + 58, key, 6);                    /* keyB = working key */
-            furui_activate(&a->dev);
-            int ok = furui_write_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, out, 64);
-            post(a, K_HF, ok, ok ? "  sector %d erased" : "  sector %d erase FAILED", s);
-            if (ok) done++;
+            memcpy(out + 58, key, 6);
+            int r = hf_write(a, s, out);
+            tw_report(a, s, r, "erased");
+            if (r == TW_OK) done++; else if (r == TW_DENIED) needB++;
         }
-        post(a, K_TOAST, done > 0, "Erased %d/16 sectors", done);
+        post(a, K_TOAST, done > 0, "Erased %d/16 sectors%s", done, needB ? " - some need Key B" : "");
         if (done) app_beep(a);
     }
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
@@ -751,28 +783,21 @@ static gpointer w_setkey(gpointer p)
     g_mutex_lock(&a->lock);
     if (ensure_ready(a)) {
         post(a, K_HF, 1, "Writing new key to every sector trailer…");
-        int done = 0;
+        int done = 0, needB = 0;
         for (int s = 0; s < 16; s++) {
-            uint8_t key[6]; int type, flag;
-            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
-            flag = type ? 2 : 1;
-            uint8_t blk[64];
-            furui_activate(&a->dev);
-            if (furui_read_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, blk, sizeof blk) < 64) {
-                post(a, K_HF, 0, "  sector %d read FAILED", s); continue;
-            }
+            uint8_t cur[64], key[6]; int type;
+            if (!hf_read(a, s, cur, key, &type)) { post(a, K_HF, 0, "  sector %d: no key found", s); continue; }
             uint8_t out[64];
-            memcpy(out, blk, 48);                         /* keep data */
-            memcpy(out + 48, j->key, 6);                  /* new keyA */
+            memcpy(out, cur, 48);                          /* keep data */
+            memcpy(out + 48, j->key, 6);                   /* new keyA */
             memcpy(out + 54, ACC_DEFAULT, 4);
-            memcpy(out + 58, j->key, 6);                  /* new keyB */
-            furui_activate(&a->dev);
-            int ok = furui_write_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, out, 64);
-            post(a, K_HF, ok, ok ? "  sector %d key updated" : "  sector %d FAILED", s);
-            if (ok) done++;
+            memcpy(out + 58, j->key, 6);                   /* new keyB */
+            int r = hf_write(a, s, out);
+            tw_report(a, s, r, "key updated");
+            if (r == TW_OK) done++; else if (r == TW_DENIED) needB++;
         }
         if (done) { furui_keys_add(j->key); app_beep(a); }   /* so later reads work */
-        post(a, K_TOAST, done > 0, "Updated key on %d/16 sectors", done);
+        post(a, K_TOAST, done > 0, "Updated key on %d/16 sectors%s", done, needB ? " - some need Key B" : "");
     }
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
