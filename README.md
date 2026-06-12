@@ -47,6 +47,9 @@ software, no Wine needed at runtime.
     sectors keyed and read)*
 - **Format** a sector, **beep** (with a mute toggle), **find/scan** (openfind),
   raw **console** (send a payload; see the decrypted reply).
+- **Tag operations** — Copy, Erase, Format memory, Set/Remove password (sector
+  keys) on Mifare Classic; Copy/Erase on LF EM4100. (Lock is intentionally not
+  implemented yet — it is irreversible.)
 - **Card insight** — card-type detection (SAK/ATQA), decoded access conditions
   and value blocks (shown inline), and a per-sector **Key map** grid.
 - **Auto-read** — optionally poll and read a card automatically when placed.

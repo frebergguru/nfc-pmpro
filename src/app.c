@@ -45,11 +45,14 @@ typedef struct {
     GtkWidget *ws_sector, *ws_key, *ws_data;   /* write sector */
     GtkWidget *fmt_sector, *fmt_key;           /* format sector */
     GtkWidget *clone_key;                       /* clone destination key A */
+    GtkWidget *setkey_entry;                     /* set-password: new key */
     GtkTextBuffer *hf_buf; GtkWidget *hf_view;
 
     /* LF / HID tab */
     GtkWidget *lf_entry;       /* LF write fields */
     GtkWidget *hid_entry;      /* HID write 12-byte card id */
+    uint8_t lf_copy[6];        /* last LF copy (for write fallback) */
+    gboolean lf_copy_have;
     GtkTextBuffer *lfhid_buf; GtkWidget *lfhid_view;
 
     /* Crack tab */
@@ -668,6 +671,154 @@ static gpointer w_write_buffer(gpointer p)
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
 
+/* ---- whole-card tag operations (Mifare Classic) ------------------------ */
+
+static const uint8_t ACC_DEFAULT[4] = {0xFF, 0x07, 0x80, 0x69};   /* transport access */
+
+/* find a working key for sector s: the box key (A), then dictionary A/B */
+static int hf_find_key(App *a, int s, uint8_t key[6], int *type)
+{
+    uint8_t blk[64];
+    furui_activate(&a->dev);
+    if (furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL, blk, sizeof blk) >= 64) {
+        memcpy(key, a->cur_key, 6); *type = 0; return 1;
+    }
+    uint8_t fk[6];
+    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 0, fk)) { memcpy(key, fk, 6); *type = 0; return 1; }
+    if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 1, fk)) { memcpy(key, fk, 6); *type = 1; return 1; }
+    return 0;
+}
+
+static gpointer w_format_all(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        post(a, K_HF, 1, "Format memory: resetting every sector to defaults…");
+        int done = 0;
+        for (int s = 0; s < 16; s++) {
+            uint8_t key[6]; int type;
+            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
+            furui_activate(&a->dev);
+            int ok = furui_format_sector(&a->dev, (uint8_t)s, type ? 2 : 1,
+                                         type ? NULL : key, type ? key : NULL);
+            post(a, K_HF, ok, ok ? "  sector %d formatted" : "  sector %d format FAILED", s);
+            if (ok) done++;
+        }
+        post(a, K_TOAST, done > 0, "Formatted %d/16 sectors", done);
+        if (done) app_beep(a);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
+}
+
+static gpointer w_erase(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        post(a, K_HF, 1, "Erase: zeroing data blocks (keeping the card usable)…");
+        int done = 0;
+        for (int s = 0; s < 16; s++) {
+            uint8_t key[6]; int type, flag;
+            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
+            flag = type ? 2 : 1;
+            uint8_t blk[64];
+            furui_activate(&a->dev);
+            if (furui_read_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, blk, sizeof blk) < 64) {
+                post(a, K_HF, 0, "  sector %d read FAILED", s); continue;
+            }
+            uint8_t out[64];
+            memset(out, 0, 48);
+            if (s == 0) memcpy(out, blk, 16);            /* keep manufacturer block */
+            memcpy(out + 48, key, 6);                    /* keyA = working key */
+            memcpy(out + 54, ACC_DEFAULT, 4);
+            memcpy(out + 58, key, 6);                    /* keyB = working key */
+            furui_activate(&a->dev);
+            int ok = furui_write_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, out, 64);
+            post(a, K_HF, ok, ok ? "  sector %d erased" : "  sector %d erase FAILED", s);
+            if (ok) done++;
+        }
+        post(a, K_TOAST, done > 0, "Erased %d/16 sectors", done);
+        if (done) app_beep(a);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
+}
+
+/* write a chosen key to every trailer (Set password); j->key == FF = Remove */
+static gpointer w_setkey(gpointer p)
+{
+    CloneJob *j = p; App *a = j->a;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        post(a, K_HF, 1, "Writing new key to every sector trailer…");
+        int done = 0;
+        for (int s = 0; s < 16; s++) {
+            uint8_t key[6]; int type, flag;
+            if (!hf_find_key(a, s, key, &type)) { post(a, K_HF, 0, "  sector %d: no key, skipped", s); continue; }
+            flag = type ? 2 : 1;
+            uint8_t blk[64];
+            furui_activate(&a->dev);
+            if (furui_read_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, blk, sizeof blk) < 64) {
+                post(a, K_HF, 0, "  sector %d read FAILED", s); continue;
+            }
+            uint8_t out[64];
+            memcpy(out, blk, 48);                         /* keep data */
+            memcpy(out + 48, j->key, 6);                  /* new keyA */
+            memcpy(out + 54, ACC_DEFAULT, 4);
+            memcpy(out + 58, j->key, 6);                  /* new keyB */
+            furui_activate(&a->dev);
+            int ok = furui_write_sector(&a->dev, (uint8_t)s, flag, type ? NULL : key, type ? key : NULL, out, 64);
+            post(a, K_HF, ok, ok ? "  sector %d key updated" : "  sector %d FAILED", s);
+            if (ok) done++;
+        }
+        if (done) { furui_keys_add(j->key); app_beep(a); }   /* so later reads work */
+        post(a, K_TOAST, done > 0, "Updated key on %d/16 sectors", done);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
+}
+
+static gpointer w_erase_lf(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        uint8_t payload[7] = {0x2D, 0, 0, 0, 0, 0, 0};   /* blank EM4100 */
+        uint8_t resp[FURUI_MAXMSG];
+        size_t r = furui_exec(&a->dev, payload, 7, resp, sizeof resp, 3000);
+        int ok = r >= 3 && resp[2] == 1;
+        post(a, K_LFHID, ok, ok ? "LF erased (blank ID written)" : "LF erase FAILED");
+        post(a, K_TOAST, ok, ok ? "LF erased" : "LF erase failed");
+        if (ok) app_beep(a);
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
+}
+
+static gpointer w_copy_lf(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        uint8_t cmd[3] = {0x28, 0x01, 0x00}, resp[FURUI_MAXMSG];
+        size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 3000);
+        if (r >= 3 && resp[2] == 1) {
+            size_t dlen = r > 5 ? r - 5 : 0;
+            int nb = dlen < 6 ? (int)dlen : 6;
+            memset(a->lf_copy, 0, 6);
+            memcpy(a->lf_copy, resp + 3, nb);
+            a->lf_copy_have = TRUE;
+            post(a, K_LFHID, 1, "LF copied: %s — swap to a blank T5577/EM4305 and "
+                 "click \"Write LF card\" (best-effort; verify the result).",
+                 hex_str(a->lf_copy, 6));
+            post(a, K_TOAST, 1, "LF copied to buffer");
+            app_beep(a);
+        } else {
+            post(a, K_LFHID, 0, "LF: no card to copy");
+            post(a, K_TOAST, 0, "No LF card");
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); return NULL;
+}
+
 typedef struct { App *a; uint8_t block; uint8_t type; int mode; } CrackJob;
 
 static gpointer w_crack(gpointer p)
@@ -844,7 +995,10 @@ static void on_write_lf(GtkButton *b, gpointer u)
     const char *t = gtk_editable_get_text(GTK_EDITABLE(a->lf_entry));
     uint8_t fields[16];
     int n = pmpro_parse_hex(t, fields, sizeof fields);
-    if (n < 6) { toast(a, "Need: freq id0 id1 id2 id3 plant"); return; }
+    if (n < 6) {
+        if (a->lf_copy_have) { memcpy(fields, a->lf_copy, 6); n = 6; }   /* use Copy LF result */
+        else { toast(a, "Need: freq id0 id1 id2 id3 plant (or use Copy LF)"); return; }
+    }
     RawJob *j = g_new0(RawJob, 1);
     j->a = a;
     j->payload[0] = 0x2D;
@@ -900,6 +1054,53 @@ static void on_write_buffer(GtkButton *b, gpointer u)
     if (pmpro_parse_hex(kt, j->key, 6) != 6) memset(j->key, 0xFF, 6);
     confirm_write(a, "Write the buffer to the card? This overwrites its sectors.", w_write_buffer, j);
 }
+
+/* ---- whole-card tag operations (buttons) ------------------------------- */
+
+static void on_copy_tag(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    toast(a, "Reading source → buffer. Then swap to a blank and use \"Write buffer → card\".");
+    on_read_hf(NULL, u);
+}
+
+static void on_erase(GtkButton *b, gpointer u)
+{
+    (void)b;
+    confirm_write(u, "Erase ALL data blocks on the card (keys kept)?", w_erase, NULL);
+}
+
+static void on_format_all(GtkButton *b, gpointer u)
+{
+    (void)b;
+    confirm_write(u, "Factory-reset ALL sectors — default key FFFFFFFFFFFF and zeroed data?",
+                  w_format_all, NULL);
+}
+
+static void on_setpw(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    CloneJob *j = g_new0(CloneJob, 1); j->a = a;
+    const char *t = gtk_editable_get_text(GTK_EDITABLE(a->setkey_entry));
+    if (pmpro_parse_hex(t, j->key, 6) != 6) { g_free(j); toast(a, "Enter a 6-byte key (12 hex)"); return; }
+    confirm_write(a, "Write this key to EVERY sector trailer? You will need it to read the card afterwards.",
+                  w_setkey, j);
+}
+
+static void on_removepw(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    CloneJob *j = g_new0(CloneJob, 1); j->a = a; memset(j->key, 0xFF, 6);
+    confirm_write(a, "Reset every sector key to the default FFFFFFFFFFFF?", w_setkey, j);
+}
+
+static void on_erase_lf(GtkButton *b, gpointer u)
+{
+    (void)b;
+    confirm_write(u, "Overwrite the LF card with a blank ID?", w_erase_lf, NULL);
+}
+
+static void on_copy_lf(GtkButton *b, gpointer u) { (void)b; start_op(u, w_copy_lf, NULL); }
 
 static void start_crack(App *a, int mode)
 {
@@ -1631,6 +1832,25 @@ static GtkWidget *page_hf(App *a)
     gtk_box_append(GTK_BOX(r4), btn("Write buffer → card", "destructive-action", G_CALLBACK(on_write_buffer), a));
     gtk_box_append(GTK_BOX(box), r4);
 
+    /* ---- whole-card tag operations ---- */
+    gtk_box_append(GTK_BOX(box), section_label("Tag operations (whole card)"));
+    GtkWidget *t0 = hrow();
+    gtk_box_append(GTK_BOX(t0), btn("Copy tag", "suggested-action", G_CALLBACK(on_copy_tag), a));
+    gtk_box_append(GTK_BOX(t0), btn("Erase tag", "destructive-action", G_CALLBACK(on_erase), a));
+    gtk_box_append(GTK_BOX(t0), btn("Format memory", "destructive-action", G_CALLBACK(on_format_all), a));
+    gtk_box_append(GTK_BOX(box), t0);
+    GtkWidget *t1 = hrow();
+    gtk_box_append(GTK_BOX(t1), gtk_label_new("New key"));
+    a->setkey_entry = entry_exp("new key A/B for all sectors, e.g. A0A1A2A3A4A5");
+    gtk_box_append(GTK_BOX(t1), a->setkey_entry);
+    gtk_box_append(GTK_BOX(t1), btn("Set password", "destructive-action", G_CALLBACK(on_setpw), a));
+    gtk_box_append(GTK_BOX(t1), btn("Remove password", "destructive-action", G_CALLBACK(on_removepw), a));
+    gtk_box_append(GTK_BOX(box), t1);
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "These act on every sector using the box key or the dictionary. \"Set/Remove "
+        "password\" writes the sector keys (Mifare's password). Lock is intentionally "
+        "omitted for now — it is irreversible."));
+
     GtkWidget *hfv = mono_view(&a->hf_buf,
         "Place a Mifare card on the reader and click Read HF.\n");
     a->hf_view = hfv;
@@ -1646,7 +1866,12 @@ static GtkWidget *page_lfhid(App *a)
     gtk_box_append(GTK_BOX(box), section_label("LF 125 kHz (EM4100 / T5577 / EM4305)"));
     GtkWidget *r0 = hrow();
     gtk_box_append(GTK_BOX(r0), btn("Read LF", "suggested-action", G_CALLBACK(on_read_lf), a));
+    gtk_box_append(GTK_BOX(r0), btn("Copy LF", "suggested-action", G_CALLBACK(on_copy_lf), a));
+    gtk_box_append(GTK_BOX(r0), btn("Erase LF", "destructive-action", G_CALLBACK(on_erase_lf), a));
     gtk_box_append(GTK_BOX(box), r0);
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "Copy LF reads the ID for write-back to a blank. T5577 password/lock aren't "
+        "exposed by the device's LF protocol, so they're not offered here."));
     gtk_box_append(GTK_BOX(box), hint_label("Write: 6 hex bytes — freq id0 id1 id2 id3 plant"));
     GtkWidget *r1 = hrow();
     a->lf_entry = entry_exp("00 12 34 56 78 00");
