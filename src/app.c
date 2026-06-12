@@ -903,8 +903,10 @@ static void settings_load(App *a)
         }
         int w = g_key_file_get_integer(kf, "ui", "width", NULL);
         int h = g_key_file_get_integer(kf, "ui", "height", NULL);
-        if (w > 0 && h > 0 && a->win)
+        if (w > 0 && h > 0 && a->win) {
+            if (w < 1000) w = 1000;   /* never restore narrower than the switcher needs */
             gtk_window_set_default_size(a->win, w, h);
+        }
         char *files = g_key_file_get_string(kf, "keys", "files", NULL);
         if (files) {
             char **parts = g_strsplit(files, ";", -1);
@@ -1245,7 +1247,9 @@ static void activate(GtkApplication *gapp, gpointer user)
     GtkWidget *win = adw_application_window_new(gapp);
     a->win = GTK_WINDOW(win);
     gtk_window_set_title(GTK_WINDOW(win), "NFC PM-Pro");
-    gtk_window_set_default_size(GTK_WINDOW(win), 920, 640);
+    gtk_window_set_default_size(GTK_WINDOW(win), 1180, 700);
+    /* keep the window wide enough that the 6-tab view switcher shows full labels */
+    gtk_widget_set_size_request(win, 1000, 560);
 
     GtkWidget *toolbar = adw_toolbar_view_new();
     GtkWidget *header = adw_header_bar_new();
