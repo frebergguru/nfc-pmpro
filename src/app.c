@@ -440,7 +440,7 @@ static void read_hf_show(App *a, furui_hf_card *c)
             post_sector(a, K_HF, s, blk, 64);
         }
     }
-    const char *ct = pmpro_card_type(sak0 >= 0 ? (uint8_t)sak0 : 0xFF, atqa, NULL);
+    const char *ct = pmpro_card_type(sak0 >= 0 ? (uint8_t)sak0 : 0xFF, atqa, c->uid_len, NULL);
     post(a, K_HF, 1, "Type: %s", ct);
     snprintf(a->last.card_type, sizeof a->last.card_type, "%s", ct);
     if (!open_sectors)
@@ -499,7 +499,7 @@ static gpointer w_read_lf(gpointer p)
     g_mutex_lock(&a->lock);
     if (ensure_ready(a)) {
         uint8_t cmd[3] = {0x28, 0x01, 0x00}, resp[FURUI_MAXMSG];
-        size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 3000);
+        size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 5000);  /* 5 s like the OEM app */
         if (r >= 3 && resp[2] == 1) {
             size_t dlen = (r > 5) ? r - 5 : 0;
             post(a, K_LFHID, 1, "LF (125 kHz)  data: %s", hex_str(resp + 3, dlen));
@@ -542,6 +542,84 @@ static gpointer w_read_hid(gpointer p)
             post(a, K_LFHID, 0, "HID: no prox card on reader");
             post(a, K_TOAST, 0, "No HID card");
         }
+    }
+    g_atomic_int_set(&a->busy, FALSE);
+    g_mutex_unlock(&a->lock);
+    return NULL;
+}
+
+/* Identify: auto-detect whatever tag is on the reader (HF → LF → HID), name its
+ * type, and show a summary on the Device page + detail on the matching tab. */
+static gpointer w_identify(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        furui_tag_id t;
+        switch (furui_identify(&a->dev, &t)) {
+        case FURUI_TAG_HF: {
+            uid_info ui; pmpro_decode_uid(t.hf.uid, t.hf.uid_len, &ui);
+            char tail[32]; pmpro_hex(t.hf.tail, t.hf.tail_len, tail, sizeof tail);
+            const char *magic = t.magic_gen1a ? "  ·  gen1a magic (UID-changeable)" : "";
+            post(a, K_INFO, 1, "Identified: %s  ·  UID %s (%d-byte)  ·  13.56 MHz%s",
+                 t.type, ui.uid, ui.uid_len, magic);
+            post(a, K_HF, 1, "Identify → %s", t.type);
+            post(a, K_HF, 1, "  UID %s (%d-byte)   ATQA %04X  SAK %02X   [tail %s]%s",
+                 ui.uid, ui.uid_len, t.atqa, t.sak, tail, magic);
+            memcpy(a->poll_uid, t.hf.uid, t.hf.uid_len); a->poll_uid_len = t.hf.uid_len;
+            post(a, K_TOAST, 1, "Identified: %s", t.type);
+            app_beep(a);
+            break;
+        }
+        case FURUI_TAG_LF: {
+            post(a, K_INFO, 1, "Identified: %s (125 kHz LF)  ·  %s",
+                 t.type, hex_str(t.data, t.data_len));
+            post(a, K_LFHID, 1, "Identify → LF (125 kHz)  data: %s",
+                 hex_str(t.data, t.data_len));
+            em4100_info em;
+            if (pmpro_decode_em4100(t.data, t.data_len, &em))
+                post(a, K_LFHID, 1, "  EM4100: id %s  customer %u  card %u  (fob %s)",
+                     em.hex, em.customer, em.card_number, em.fob_text);
+            post(a, K_TOAST, 1, "Identified: 125 kHz LF tag");
+            app_beep(a);
+            break;
+        }
+        case FURUI_TAG_HID:
+            post(a, K_INFO, 1, "Identified: HID Prox  ·  %s", hex_str(t.data, t.data_len));
+            post(a, K_LFHID, 1, "Identify → HID prox (%zu bytes): %s",
+                 t.data_len, hex_str(t.data, t.data_len));
+            post(a, K_TOAST, 1, "Identified: HID prox");
+            app_beep(a);
+            break;
+        default:
+            post(a, K_INFO, 0, "No tag detected on the reader "
+                 "(tried HF 13.56 MHz, LF 125 kHz, and HID prox).");
+            post(a, K_TOAST, 0, "No tag found");
+        }
+    }
+    g_atomic_int_set(&a->busy, FALSE);
+    g_mutex_unlock(&a->lock);
+    return NULL;
+}
+
+/* Magic test: detect a UID-changeable (gen1a / gen2-CUID) card. WRITES block 0
+ * (and restores it) — gated behind a confirm dialog. */
+static gpointer w_magic(gpointer p)
+{
+    App *a = p;
+    g_mutex_lock(&a->lock);
+    if (ensure_ready(a)) {
+        char d[160];
+        furui_magic_kind k = furui_magic_test(&a->dev, d, sizeof d);
+        const char *label =
+            k == FURUI_MAGIC_GEN1A  ? "gen1a magic (UID-changeable)" :
+            k == FURUI_MAGIC_GEN2   ? "gen2/CUID magic (UID-changeable)" :
+            k == FURUI_MAGIC_NONE   ? "genuine card (not magic)" :
+            k == FURUI_MAGIC_NOCARD ? "no HF card" : "couldn't probe";
+        int magic = (k == FURUI_MAGIC_GEN1A || k == FURUI_MAGIC_GEN2);
+        post(a, K_HF, magic, "Magic test: %s — %s", label, d);
+        post(a, K_TOAST, magic, "Magic test: %s", label);
+        if (magic) app_beep(a);
     }
     g_atomic_int_set(&a->busy, FALSE);
     g_mutex_unlock(&a->lock);
@@ -905,7 +983,7 @@ static gpointer w_copy_lf(gpointer p)
     g_mutex_lock(&a->lock);
     if (ensure_ready(a)) {
         uint8_t cmd[3] = {0x28, 0x01, 0x00}, resp[FURUI_MAXMSG];
-        size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 3000);
+        size_t r = furui_exec(&a->dev, cmd, 3, resp, sizeof resp, 5000);  /* 5 s like the OEM app */
         if (r >= 3 && resp[2] == 1) {
             size_t dlen = r > 5 ? r - 5 : 0;
             int nb = dlen < 6 ? (int)dlen : 6;
@@ -1080,6 +1158,15 @@ static void on_read_hf(GtkButton *b, gpointer u)
 }
 static void on_read_lf(GtkButton *b, gpointer u) { (void)b; start_op(u, w_read_lf, NULL); }
 static void on_read_hid(GtkButton *b, gpointer u) { (void)b; start_op(u, w_read_hid, NULL); }
+static void on_identify(GtkButton *b, gpointer u) { (void)b; start_op(u, w_identify, NULL); }
+static void on_magic(GtkButton *b, gpointer u)
+{
+    (void)b;
+    confirm_write(u, "Run the magic-card test? It writes block 0 of the card "
+        "(flips one byte, then restores it) to check whether the UID/block 0 is "
+        "changeable (gen1a or gen2/CUID magic). A genuine card just rejects the write.",
+        w_magic, NULL);
+}
 
 static void on_send_raw(GtkButton *b, gpointer u)
 {
@@ -1854,6 +1941,10 @@ static GtkWidget *page_device(App *a)
     GtkWidget *box = page_box();
     GtkWidget *row = hrow();
     gtk_box_append(GTK_BOX(row), btn("Connect", "suggested-action", G_CALLBACK(on_connect), a));
+    GtkWidget *ident = btn("Identify tag", NULL, G_CALLBACK(on_identify), a);
+    gtk_widget_set_tooltip_text(ident, "Detect whatever tag is on the reader and name its "
+        "type — tries HF 13.56 MHz, then 125 kHz LF, then HID prox (requires Connect)");
+    gtk_box_append(GTK_BOX(row), ident);
     gtk_box_append(GTK_BOX(row), btn("Beep", NULL, G_CALLBACK(on_beep), a));
     GtkWidget *find = btn("Find / scan", NULL, G_CALLBACK(on_openfind), a);
     gtk_widget_set_tooltip_text(find, "Turn on the device's card-scan indicator (cmd 0F)");
@@ -1944,6 +2035,10 @@ static GtkWidget *page_hf(App *a)
     gtk_box_append(GTK_BOX(t0), btn("Copy tag", "suggested-action", G_CALLBACK(on_copy_tag), a));
     gtk_box_append(GTK_BOX(t0), btn("Erase tag", "destructive-action", G_CALLBACK(on_erase), a));
     gtk_box_append(GTK_BOX(t0), btn("Format memory", "destructive-action", G_CALLBACK(on_format_all), a));
+    GtkWidget *magicbtn = btn("Magic test", NULL, G_CALLBACK(on_magic), a);
+    gtk_widget_set_tooltip_text(magicbtn, "Check whether the card is a UID-changeable magic "
+        "card (gen1a or gen2/CUID). Writes block 0 and restores it; a genuine card rejects the write.");
+    gtk_box_append(GTK_BOX(t0), magicbtn);
     gtk_box_append(GTK_BOX(box), t0);
     GtkWidget *t1 = hrow();
     gtk_box_append(GTK_BOX(t1), gtk_label_new("New key"));

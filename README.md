@@ -7,6 +7,18 @@ software, no Wine needed at runtime.
 
 ## What works (all verified on real hardware unless noted)
 - **Connect** — identify + RC4 handshake.
+- **Identify tag** — one button (Device page) / `pmctl identify` that auto-detects
+  whatever is on the reader: HF 13.56 MHz, then 125 kHz LF, then HID prox. Names
+  the type (Classic 1K/4K/Mini, Plus, DESFire, Ultralight/NTAG family, …) and
+  flags gen1a/UID0 magic cards. Note: the device only reports ATQA+SAK, so the
+  Ultralight/NTAG family can't be split into UL / UL-C / EV1 / NTAG21x (that needs
+  a GET_VERSION frame the PM-Pro protocol doesn't expose — the OEM app can't
+  either).
+- **Magic test** — a button (HF tab) / `pmctl magic` that tells a genuine card
+  from a UID-changeable **magic** card. Detects **gen1a** (cmd 1D backdoor) and
+  **gen2/CUID** (block 0 writable) — the latter by flipping one block-0 byte,
+  reading it back, then restoring it. (A CUID card is read-identical to a real
+  one, so this is the only way to spot it; it writes block 0 and restores it.)
 - **Read HF** (13.56 MHz, ISO14443A) — UID/type, and a per-sector dump. Each
   sector is read with the key in the box, falling back to the dictionary
   (built-in + loaded `.keys` + keys imported from a dump). Output is rendered
@@ -77,6 +89,7 @@ Needs `gtk4`, `libadwaita`, a C compiler, CMake/Ninja. The device I/O is pure
 cmake -G Ninja -S . -B build && ninja -C build
 ./build/pmpro           # GUI
 ./build/pmctl connect   # CLI: connect+beep
+./build/pmctl identify  # CLI: auto-detect the tag on the reader + its type
 ./build/pmctl readic    # CLI: read a 13.56 MHz card
 ```
 Install it as a desktop app (adds a launcher + icon):

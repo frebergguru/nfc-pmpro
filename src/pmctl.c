@@ -1,5 +1,7 @@
 /* pmctl.c — CLI to drive the PM-Pro over the reversed protocol.
  *   pmctl connect        identify + handshake
+ *   pmctl identify       auto-detect the tag on the reader (HF/LF/HID) + type
+ *   pmctl magic          test if the HF card is gen1a/gen2-CUID magic (writes block 0)
  *   pmctl beep [t] [c]   beep the device
  *   pmctl raw <hex>      send one command payload, print decrypted response
  */
@@ -80,6 +82,48 @@ int main(int argc, char **argv)
         size_t r = furui_exec(&dev, p, 3, resp, sizeof resp, 3000);
         printf("LF read ack=%d\n", r >= 3 && resp[2] == 1);
         if (r) show("resp(dec)", resp, r < 64 ? r : 64);
+    } else if (!strcmp(cmd, "identify")) {
+        if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        furui_tag_id t;
+        switch (furui_identify(&dev, &t)) {
+        case FURUI_TAG_HF: {
+            char uid[40], tail[32];
+            pmpro_hex(t.hf.uid, t.hf.uid_len, uid, sizeof uid);
+            pmpro_hex(t.hf.tail, t.hf.tail_len, tail, sizeof tail);
+            printf("HF 13.56 MHz: %s\n", t.type);
+            printf("  UID %s (%d-byte)  ATQA %04X  SAK %02X  [tail %s]%s\n",
+                   uid, t.hf.uid_len, t.atqa, t.sak, tail,
+                   t.magic_gen1a ? "  gen1a magic (UID-changeable)" : "");
+            break;
+        }
+        case FURUI_TAG_LF: {
+            char h[200]; pmpro_hex(t.data, t.data_len, h, sizeof h);
+            printf("LF 125 kHz: %s  data %s\n", t.type, h);
+            em4100_info em;
+            if (pmpro_decode_em4100(t.data, t.data_len, &em))
+                printf("  EM4100 id %s customer %u card %u fob %s\n",
+                       em.hex, em.customer, em.card_number, em.fob_text);
+            break;
+        }
+        case FURUI_TAG_HID: {
+            char h[200]; pmpro_hex(t.data, t.data_len, h, sizeof h);
+            printf("HID prox (%zu bytes): %s\n", t.data_len, h);
+            break;
+        }
+        default:
+            printf("no tag detected (tried HF 13.56 MHz, LF 125 kHz, HID prox)\n");
+        }
+    } else if (!strcmp(cmd, "magic")) {
+        /* WRITES to block 0 (restored afterwards) to detect a gen2/CUID card. */
+        if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        char d[160];
+        furui_magic_kind k = furui_magic_test(&dev, d, sizeof d);
+        const char *label =
+            k == FURUI_MAGIC_GEN1A   ? "GEN1A MAGIC" :
+            k == FURUI_MAGIC_GEN2    ? "GEN2/CUID MAGIC" :
+            k == FURUI_MAGIC_NONE    ? "not magic (genuine)" :
+            k == FURUI_MAGIC_NOCARD  ? "no card" : "unknown";
+        printf("magic test: %s — %s\n", label, d);
     } else if (!strcmp(cmd, "dumphf")) {
         if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
         uint8_t resp[FURUI_MAXMSG];
@@ -313,7 +357,7 @@ int main(int argc, char **argv)
         if (r) show("resp(dec)", resp, r < 64 ? r : 64);
         else printf("no/blank response\n");
     } else {
-        printf("usage: pmctl [connect|beep [t] [c]|raw <hex>]\n");
+        printf("usage: pmctl [connect|identify|magic|beep [t] [c]|raw <hex>]\n");
     }
     pmpro_close(&dev);
     return 0;

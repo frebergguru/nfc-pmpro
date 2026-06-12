@@ -196,7 +196,7 @@ int furui_autopwn(pmpro_dev *dev, const char *mfd_path,
         furui_activate(dev);
         if (furui_read_sector(dev, 0, 1, k0, NULL, b0, sizeof b0) >= 16) {
             int s = 0;
-            pmpro_card_type(b0[5], atqa, &s);
+            pmpro_card_type(b0[5], atqa, card.uid_len, &s);
             if (s > 0) nsec = s;
         }
     }

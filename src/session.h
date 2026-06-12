@@ -49,6 +49,44 @@ typedef struct {
 /* Read the HF card on the reader (cmd 21). Returns 1 if a card is present. */
 int furui_read_hf(pmpro_dev *dev, furui_hf_card *card);
 
+/* What furui_identify() found on the reader. */
+typedef enum { FURUI_TAG_NONE, FURUI_TAG_HF, FURUI_TAG_LF, FURUI_TAG_HID } furui_tag_kind;
+
+typedef struct {
+    furui_tag_kind kind;
+    furui_hf_card  hf;           /* valid when kind == FURUI_TAG_HF */
+    uint16_t       atqa;         /* HF */
+    uint8_t        sak;          /* HF */
+    const char    *type;         /* human-readable type label (static string) */
+    int            sectors;      /* HF: Mifare Classic sector count, else 0 */
+    int            magic_gen1a;  /* HF: 1 if the cmd 1D backdoor read answered (UID0/gen1a magic) */
+    uint8_t        data[64];     /* raw id bytes when kind == LF / HID */
+    size_t         data_len;
+} furui_tag_id;
+
+/* Auto-detect whatever tag is on the reader: probe HF (cmd 21), then 125 kHz LF
+ * (cmd 28), then HID prox (cmd 29); fill `out` with the first hit and name its
+ * type. For HF also flags gen1a/UID0 magic via the cmd 1D backdoor read. Does no
+ * key cracking or sector reads. Returns the detected kind (NONE if empty). */
+furui_tag_kind furui_identify(pmpro_dev *dev, furui_tag_id *out);
+
+/* Result of furui_magic_test(). */
+typedef enum {
+    FURUI_MAGIC_NOCARD,   /* no HF card on the reader */
+    FURUI_MAGIC_NONE,     /* genuine card — block 0 is read-only */
+    FURUI_MAGIC_GEN1A,    /* gen1a — answers the cmd 1D backdoor */
+    FURUI_MAGIC_GEN2,     /* gen2/CUID — block 0 writable via normal auth */
+    FURUI_MAGIC_UNKNOWN   /* couldn't run the gen2 probe (sector 0 key unknown) */
+} furui_magic_kind;
+
+/* Probe whether the HF card is a UID-changeable "magic" card. First tries the
+ * gen1a backdoor (cmd 1D). If that fails, runs a gen2/CUID probe: flip one
+ * manufacturer byte of block 0, write it (default key), read back to see if it
+ * stuck (a genuine card rejects the block-0 write), then restore block 0.
+ * **This WRITES to block 0** (restored afterwards) — caller should confirm.
+ * `detail` (cap) gets a short human note. */
+furui_magic_kind furui_magic_test(pmpro_dev *dev, char *detail, size_t cap);
+
 /* Activate the HF card (cmd 10). Returns 1 on ack. */
 int furui_activate(pmpro_dev *dev);
 

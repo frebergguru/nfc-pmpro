@@ -82,25 +82,41 @@ void pmpro_decode_uid(const unsigned char *uid, size_t len, uid_info *out)
     out->uid_len = (int)len;
 }
 
-const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int *sectors)
+const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int uid_len, int *sectors)
 {
     int s = 0;
     const char *t;
     switch (sak) {
-    case 0x08: t = "Mifare Classic 1K"; s = 16; break;
-    case 0x09: t = "Mifare Mini";       s = 5;  break;
-    case 0x18: t = "Mifare Classic 4K"; s = 40; break;
-    case 0x10: t = "Mifare Plus 2K";    s = 32; break;
-    case 0x11: t = "Mifare Plus 4K";    s = 40; break;
-    case 0x00: t = (atqa == 0x0044) ? "Mifare Ultralight / NTAG" : "Mifare Ultralight"; break;
-    case 0x20: t = "Mifare DESFire / Plus"; break;
-    case 0x28: t = "JCOP / SmartMX";    break;
+    case 0x00:
+        /* Ultralight/NTAG family — the device can't tell the variants apart
+         * (would need GET_VERSION), so name the family. */
+        t = (atqa == 0x0044) ? "Mifare Ultralight / NTAG (family)"
+                             : "Mifare Ultralight";
+        break;
+    case 0x08: t = "Mifare Classic 1K (S50)"; s = 16; break;
+    case 0x09: t = "Mifare Mini";             s = 5;  break;
+    case 0x18: t = "Mifare Classic 4K (S70)"; s = 40; break;
+    case 0x10: t = "Mifare Plus 2K (SL2)";    s = 32; break;
+    case 0x11: t = "Mifare Plus 4K (SL2)";    s = 40; break;
+    case 0x20:
+        /* ISO14443-4: DESFire vs Plus-SL3 — ATQA 0x0344 is the DESFire family. */
+        t = (atqa == 0x0344) ? "Mifare DESFire / DESFire EV1"
+                             : "Mifare Plus (SL3) / DESFire";
+        break;
+    case 0x28: t = "JCOP / SmartMX (Classic emulation)"; s = 16; break;
+    case 0x38: t = "SmartMX (Classic 4K emulation)";     s = 40; break;
+    case 0x88: t = "Infineon Mifare Classic 1K";         s = 16; break;
     default:
-        if      (atqa == 0x0004) { t = "Mifare Classic 1K"; s = 16; }
-        else if (atqa == 0x0002) { t = "Mifare Classic 4K"; s = 40; }
+        if      (atqa == 0x0004) { t = "Mifare Classic 1K (S50)"; s = 16; }
+        else if (atqa == 0x0002) { t = "Mifare Classic 4K (S70)"; s = 40; }
+        else if (atqa == 0x0044) { t = "Mifare Ultralight / NTAG (family)"; }
+        else if (atqa == 0x0344) { t = "Mifare DESFire"; }
         else                       t = "Unknown ISO14443A";
         break;
     }
+    /* A 7-byte UID on a "1K/4K" SAK usually means a Plus/EV1 in Classic mode,
+     * but the name stays correct; uid_len is only a hint and kept for callers. */
+    (void)uid_len;
     if (sectors) *sectors = s;
     return t;
 }

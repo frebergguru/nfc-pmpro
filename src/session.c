@@ -1,5 +1,7 @@
 #include "session.h"
 #include "furui.h"
+#include "protocol.h"
+#include <stdio.h>
 #include <string.h>
 
 size_t furui_exec(pmpro_dev *dev, const uint8_t *payload, size_t len,
@@ -48,6 +50,9 @@ static int ack(const uint8_t *resp, size_t len)
 {
     return len >= 3 && resp[2] == 1;
 }
+
+static const uint8_t KEY_FF[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static const uint8_t KEY_00[6] = {0,0,0,0,0,0};
 
 int furui_connect(pmpro_dev *dev)
 {
@@ -170,8 +175,124 @@ int furui_activate(pmpro_dev *dev)
     return ack(resp, r);
 }
 
-static const uint8_t KEY_FF[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-static const uint8_t KEY_00[6] = {0,0,0,0,0,0};
+/* Is there a gen1a/UID0 magic card present? cmd 1D is the gen1a backdoor block
+ * read (no auth): a normal card rejects it, a UID-changeable magic answers. The
+ * backdoor is flaky — the device's read only succeeds intermittently — so retry
+ * a handful of times (the OEM app retries too) before giving up. */
+static int furui_is_gen1a_magic(pmpro_dev *dev)
+{
+    uint8_t resp[FURUI_MAXMSG], p[2] = {0x1D, 0x00};   /* read block 0 */
+    furui_activate(dev);
+    for (int i = 0; i < 10; i++) {
+        size_t r = furui_exec(dev, p, sizeof p, resp, sizeof resp, 2000);
+        if (ack(resp, r))
+            return 1;
+    }
+    return 0;
+}
+
+furui_tag_kind furui_identify(pmpro_dev *dev, furui_tag_id *out)
+{
+    memset(out, 0, sizeof *out);
+
+    /* 1) HF (13.56 MHz, ISO14443A) — cmd 21 returns UID + ATQA (+ a trailing
+     * byte that is NOT the SAK). */
+    if (furui_read_hf(dev, &out->hf)) {
+        out->kind = FURUI_TAG_HF;
+        out->atqa = out->hf.tail_len >= 2
+                  ? (out->hf.tail[0] | (uint16_t)out->hf.tail[1] << 8) : 0;
+        /* The real SAK lives in block 0 byte 5, not in the cmd 21 reply, so
+         * recover it with an authenticated read using the default key (this is
+         * also how the OEM app types a card). Falls back to ATQA-only typing
+         * (sak 0xFF) when sector 0 is key-protected. */
+        out->sak = 0xFF;
+        uint8_t blk[64];
+        furui_activate(dev);
+        if (furui_read_sector(dev, 0, 1, KEY_FF, NULL, blk, sizeof blk) >= 16)
+            out->sak = blk[5];
+        out->type = pmpro_card_type(out->sak, out->atqa, out->hf.uid_len,
+                                    &out->sectors);
+        out->magic_gen1a = furui_is_gen1a_magic(dev);
+        return out->kind;
+    }
+
+    /* 2) LF (125 kHz, EM4100/EM4200) — cmd 28, Auto=1 Freq=0 (5 s like the OEM). */
+    uint8_t resp[FURUI_MAXMSG], lf[3] = {0x28, 0x01, 0x00};
+    size_t r = furui_exec(dev, lf, sizeof lf, resp, sizeof resp, 5000);
+    if (ack(resp, r)) {
+        size_t dlen = r > 5 ? r - 5 : 0;
+        if (dlen > sizeof out->data) dlen = sizeof out->data;
+        memcpy(out->data, resp + 3, dlen);
+        out->data_len = dlen;
+        out->kind = FURUI_TAG_LF;
+        out->type = "EM4100 / 125 kHz ID";
+        return out->kind;
+    }
+
+    /* 3) HID prox — cmd 29. Also catches a T5577 emulating HID (the LF read
+     * above only sees EM-family IDs). */
+    size_t n = furui_read_hid(dev, out->data, sizeof out->data);
+    if (n) {
+        out->data_len = n;
+        out->kind = FURUI_TAG_HID;
+        out->type = "HID Prox";
+        return out->kind;
+    }
+
+    return FURUI_TAG_NONE;
+}
+
+furui_magic_kind furui_magic_test(pmpro_dev *dev, char *detail, size_t cap)
+{
+    furui_hf_card card;
+    if (!furui_read_hf(dev, &card)) {
+        if (detail) snprintf(detail, cap, "no HF card on the reader");
+        return FURUI_MAGIC_NOCARD;
+    }
+
+    /* gen1a: the cmd 1D backdoor block read works without authentication. */
+    if (furui_is_gen1a_magic(dev)) {
+        if (detail) snprintf(detail, cap, "answers the gen1a backdoor (cmd 1D) — UID-changeable");
+        return FURUI_MAGIC_GEN1A;
+    }
+
+    /* gen2/CUID: a normal card's block 0 is read-only; a CUID accepts a block-0
+     * write. Read sector 0, flip one manufacturer byte, write, read back. */
+    uint8_t sec0[64];
+    furui_activate(dev);
+    if (furui_read_sector(dev, 0, 1, KEY_FF, NULL, sec0, sizeof sec0) < 16) {
+        if (detail) snprintf(detail, cap,
+            "sector 0 not readable with the default key — load its key to run the gen2 probe");
+        return FURUI_MAGIC_UNKNOWN;
+    }
+    /* Preserve the trailer: the read masks keyA to 00, so restore it to the key
+     * we authenticated with; access bits + keyB read back intact. */
+    memcpy(sec0 + 48, KEY_FF, 6);
+    uint8_t orig = sec0[8];                 /* byte 8 = first manufacturer byte (after UID/BCC/SAK/ATQA) */
+
+    uint8_t buf[64];
+    memcpy(buf, sec0, sizeof buf);
+    buf[8] = (uint8_t)(orig ^ 0xFF);
+    furui_activate(dev);
+    furui_write_sector(dev, 0, 1, KEY_FF, NULL, buf, sizeof buf);  /* device ACKs regardless; verify by read-back */
+
+    uint8_t back[64];
+    int changed = 0;
+    furui_activate(dev);
+    if (furui_read_sector(dev, 0, 1, KEY_FF, NULL, back, sizeof back) >= 16)
+        changed = (back[8] == (uint8_t)(orig ^ 0xFF));
+
+    /* Always restore the original block 0 (a genuine card rejects this anyway). */
+    furui_activate(dev);
+    furui_write_sector(dev, 0, 1, KEY_FF, NULL, sec0, sizeof sec0);
+
+    if (changed) {
+        if (detail) snprintf(detail, cap, "block 0 is writable (gen2/CUID) — UID-changeable magic");
+        return FURUI_MAGIC_GEN2;
+    }
+    if (detail) snprintf(detail, cap, "block 0 is read-only — genuine (non-magic) card");
+    return FURUI_MAGIC_NONE;
+}
 
 size_t furui_read_sector(pmpro_dev *dev, uint8_t sector, uint8_t flag,
                          const uint8_t keyA[6], const uint8_t keyB[6],

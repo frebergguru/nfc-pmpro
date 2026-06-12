@@ -42,9 +42,12 @@ typedef struct {
 
 void pmpro_decode_uid(const unsigned char *uid, size_t len, uid_info *out);
 
-/* Map SAK (+ ATQA as a hint) to a card-type name. *sectors gets the Mifare
- * Classic sector count (0 if not Classic / unknown). Returns a static string. */
-const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int *sectors);
+/* Map SAK + ATQA (+ UID length as a hint) to a card-type name. *sectors gets the
+ * Mifare Classic sector count (0 if not Classic / unknown). Returns a static
+ * string. NB: the PM-Pro only reports ATQA+SAK, so the Ultralight/NTAG family
+ * can't be split into UL / UL-C / EV1 / NTAG21x — those need a GET_VERSION frame
+ * the device's protocol doesn't expose. Pass uid_len 0 if unknown. */
+const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int uid_len, int *sectors);
 
 /* True if `block` (16 bytes) is a Mifare value block; fills *value (signed,
  * little-endian) and *addr (the address byte) when non-NULL. */

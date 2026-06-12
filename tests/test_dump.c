@@ -25,9 +25,9 @@ int main(void)
 
     /* ---- card type ---- */
     int sec = -1;
-    CHECK(strstr(pmpro_card_type(0x08, 0x0004, &sec), "1K") && sec == 16, "SAK 08 -> 1K/16");
-    CHECK(strstr(pmpro_card_type(0x18, 0x0002, &sec), "4K") && sec == 40, "SAK 18 -> 4K/40");
-    CHECK(strstr(pmpro_card_type(0x00, 0x0044, NULL), "Ultralight"), "SAK 00 -> Ultralight");
+    CHECK(strstr(pmpro_card_type(0x08, 0x0004, 4, &sec), "1K") && sec == 16, "SAK 08 -> 1K/16");
+    CHECK(strstr(pmpro_card_type(0x18, 0x0002, 4, &sec), "4K") && sec == 40, "SAK 18 -> 4K/40");
+    CHECK(strstr(pmpro_card_type(0x00, 0x0044, 7, NULL), "Ultralight"), "SAK 00 -> Ultralight");
 
     /* ---- access-condition decode (transport FF 07 80) ---- */
     unsigned char tr[16] = {0xff,0xff,0xff,0xff,0xff,0xff, 0xff,0x07,0x80,0x69,
