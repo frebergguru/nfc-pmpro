@@ -11,6 +11,7 @@
 #include <gtk/gtk.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "hidraw.h"
 #include "furui.h"
@@ -77,12 +78,82 @@ enum { K_STATUS, K_TOAST, K_INFO, K_HF, K_LFHID, K_CRACK, K_DUMP, K_CONSOLE };
 
 typedef struct { App *a; int kind; int ok; char text[1024]; } UiMsg;
 
+/* colour tags, matching MifareClassicTool's scheme so dumps look familiar:
+ * UID/manufacturer block = orange, Key A = green, ACs = red, Key B = blue.
+ * Plus the two sides of a diff (dump A green, dump B red). Added only to the
+ * buffers that show card data (HF + Dump). */
+static void buf_add_tags(GtkTextBuffer *b)
+{
+    gtk_text_buffer_create_tag(b, "uid",  "foreground", "#ff7800",
+                               "weight", PANGO_WEIGHT_BOLD, NULL);   /* UID/manuf — orange */
+    gtk_text_buffer_create_tag(b, "keyA", "foreground", "#2ec27e",
+                               "weight", PANGO_WEIGHT_BOLD, NULL);   /* key A — green */
+    gtk_text_buffer_create_tag(b, "acs",  "foreground", "#e01b24", NULL); /* ACs — red */
+    gtk_text_buffer_create_tag(b, "keyB", "foreground", "#3584e4",
+                               "weight", PANGO_WEIGHT_BOLD, NULL);   /* key B — blue */
+    gtk_text_buffer_create_tag(b, "diffA", "foreground", "#2ec27e", NULL); /* dump A — green */
+    gtk_text_buffer_create_tag(b, "diffB", "foreground", "#e01b24", NULL); /* dump B — red */
+}
+
+static int is_hexch(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+static void tag_range(GtkTextBuffer *b, int base, int from, int to, const char *tag)
+{
+    GtkTextIter a, z;
+    gtk_text_buffer_get_iter_at_offset(b, &a, base + from);
+    gtk_text_buffer_get_iter_at_offset(b, &z, base + to);
+    gtk_text_buffer_apply_tag_by_name(b, tag, &a, &z);
+}
+
+/* Colour one just-inserted line `t` starting at char offset `base`. */
+static void colorize_line(GtkTextBuffer *buf, int base, const char *t)
+{
+    if (!gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buf), "keyA"))
+        return;   /* this buffer isn't colourised */
+
+    /* diff sides: leading spaces then "A:" / "B:" → colour the whole line */
+    const char *p = t;
+    while (*p == ' ') p++;
+    int len = (int)strlen(t);
+    if ((p[0] == 'A' || p[0] == 'a') && p[1] == ':') { tag_range(buf, base, 0, len, "diffA"); return; }
+    if ((p[0] == 'B' || p[0] == 'b') && p[1] == ':') { tag_range(buf, base, 0, len, "diffB"); return; }
+
+    /* otherwise: find the trailing "XX XX …" hex run and colour the trailer
+     * keys (last 16 bytes = keyA[0..5], access[6..9], keyB[10..15]). */
+    int hs = len;
+    while (hs > 0 && (is_hexch(t[hs - 1]) || t[hs - 1] == ' ')) hs--;
+    while (hs < len && t[hs] == ' ') hs++;
+    int runlen = len - hs;
+    if (runlen < 16) return;
+    int bytes = (runlen + 1) / 3;                 /* "XX XX … XX" = 3*bytes-1 chars */
+    if (bytes != 16 && bytes != 64 && bytes != 256) return;   /* a sector w/ trailer */
+
+    /* sector index = first integer in the prefix; sector 0 block 0 is the
+     * UID/manufacturer block (colour its first 16 bytes orange). */
+    int sec = -1;
+    for (const char *q = t; q < t + hs; q++)
+        if (*q >= '0' && *q <= '9') { sec = atoi(q); break; }
+    if (sec == 0)
+        tag_range(buf, base, hs, hs + 15 * 3 + 2, "uid");
+
+    /* trailer = last 16 bytes: keyA[0..5] ACs[6..9] keyB[10..15] */
+    int ka = bytes - 16;
+    tag_range(buf, base, hs + ka * 3,          hs + (ka + 5) * 3 + 2,  "keyA");
+    tag_range(buf, base, hs + (ka + 6) * 3,    hs + (ka + 9) * 3 + 2,  "acs");
+    tag_range(buf, base, hs + (ka + 10) * 3,   hs + (ka + 15) * 3 + 2, "keyB");
+}
+
 static void append_view(GtkTextBuffer *buf, GtkWidget *view, const char *t)
 {
     GtkTextIter end;
     gtk_text_buffer_get_end_iter(buf, &end);
+    int base = gtk_text_iter_get_offset(&end);
     gtk_text_buffer_insert(buf, &end, t, -1);
     gtk_text_buffer_insert(buf, &end, "\n", -1);
+    colorize_line(buf, base, t);
     GtkTextMark *m = gtk_text_buffer_get_insert(buf);
     gtk_text_buffer_get_end_iter(buf, &end);
     gtk_text_buffer_move_mark(buf, m, &end);
@@ -1092,6 +1163,7 @@ static GtkWidget *page_hf(App *a)
     GtkWidget *hfv = mono_view(&a->hf_buf,
         "Place a Mifare card on the reader and click Read HF.\n");
     a->hf_view = hfv;
+    buf_add_tags(a->hf_buf);
     gtk_box_append(GTK_BOX(box), scrolled(hfv));
     return box;
 }
@@ -1198,6 +1270,7 @@ static GtkWidget *page_dump(App *a)
     GtkWidget *dv = mono_view(&a->dump_buf,
         "Load a .pmdump or .mfd, or read a card on the HF/LF tab, then Show buffer.\n");
     a->dump_view = dv;
+    buf_add_tags(a->dump_buf);
     gtk_box_append(GTK_BOX(box), scrolled(dv));
     return box;
 }
