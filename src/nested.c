@@ -17,6 +17,7 @@
 #include "furui.h"
 #include "crack.h"
 #include "crypto1.h"
+#include "protocol.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -184,10 +185,21 @@ int furui_autopwn(pmpro_dev *dev, const char *mfd_path,
     char m[160];
     #define PROG(...) do { snprintf(m, sizeof m, __VA_ARGS__); if (prog) prog(m, u); } while (0)
 
-    /* card size from SAK (cmd 21): SAK&0x18==0x18 -> 4K (40 sectors), else 1K */
+    /* card size: read block 0's SAK (reliable) once a sector-0 key is known;
+     * fall back to the cmd-21 ATQA, else assume 1K. */
     furui_hf_card card;
     if (!furui_read_hf(dev, &card)) { snprintf(log, lcap, "no card on reader"); return 0; }
-    int nsec = (card.tail_len >= 2 && (card.tail[1] & 0x18) == 0x18) ? 40 : 16;
+    uint16_t atqa = card.tail_len >= 2 ? (card.tail[0] | (uint16_t)card.tail[1] << 8) : 0;
+    int nsec = 16;
+    uint8_t k0[6], b0[64];
+    if (furui_dict_attack(dev, 0, 0, k0)) {
+        furui_activate(dev);
+        if (furui_read_sector(dev, 0, 1, k0, NULL, b0, sizeof b0) >= 16) {
+            int s = 0;
+            pmpro_card_type(b0[5], atqa, &s);
+            if (s > 0) nsec = s;
+        }
+    }
     int nblk = nsec <= 32 ? nsec * 4 : 32 * 4 + (nsec - 32) * 16;
     PROG("card UID %02x%02x%02x%02x, %s (%d sectors)", card.uid[0], card.uid[1],
          card.uid[2], card.uid[3], nsec == 16 ? "Mifare 1K" : "Mifare 4K", nsec);

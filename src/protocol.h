@@ -42,4 +42,16 @@ typedef struct {
 
 void pmpro_decode_uid(const unsigned char *uid, size_t len, uid_info *out);
 
+/* Map SAK (+ ATQA as a hint) to a card-type name. *sectors gets the Mifare
+ * Classic sector count (0 if not Classic / unknown). Returns a static string. */
+const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int *sectors);
+
+/* True if `block` (16 bytes) is a Mifare value block; fills *value (signed,
+ * little-endian) and *addr (the address byte) when non-NULL. */
+int pmpro_value_block(const unsigned char block[16], int32_t *value, uint8_t *addr);
+
+/* Decode a sector trailer's access bits (bytes 6..8) into a short human-readable
+ * summary written to `out` (size n): the three data groups + the trailer. */
+void pmpro_decode_acs(const unsigned char trailer[16], char *out, size_t n);
+
 #endif /* PMPRO_PROTOCOL_H */

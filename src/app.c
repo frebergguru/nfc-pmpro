@@ -96,6 +96,8 @@ static void buf_add_tags(GtkTextBuffer *b)
     gtk_text_buffer_create_tag(b, "keyB", "foreground", "#3584e4",
                                "weight", PANGO_WEIGHT_BOLD, NULL);   /* key B — blue */
     gtk_text_buffer_create_tag(b, "value", "foreground", "#f5c211", NULL); /* value block — yellow */
+    gtk_text_buffer_create_tag(b, "dim", "foreground", "#9a9a9a",
+                               "style", PANGO_STYLE_ITALIC, NULL);  /* decode notes */
     gtk_text_buffer_create_tag(b, "diffA", "foreground", "#2ec27e", NULL); /* dump A — green */
     gtk_text_buffer_create_tag(b, "diffB", "foreground", "#e01b24", NULL); /* dump B — red */
 }
@@ -166,21 +168,27 @@ static void append_view(GtkTextBuffer *buf, GtkWidget *view, const char *t)
         gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(view), m);
 }
 
-/* A Mifare value block is value(4) ~value(4) value(4) addr ~addr addr ~addr. */
-static int is_value_block(const uint8_t *b)
+/* insert a dim/italic note line (decode hints), tagged "dim" if available */
+static void append_dim(GtkTextBuffer *buf, const char *text)
 {
-    if (memcmp(b, b + 8, 4) != 0) return 0;
-    for (int i = 0; i < 4; i++)
-        if ((uint8_t)~b[i] != b[4 + i]) return 0;
-    if (b[12] != b[14] || b[13] != b[15]) return 0;
-    if ((uint8_t)~b[12] != b[13]) return 0;
-    return 1;
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+    int base = gtk_text_iter_get_offset(&end);
+    gtk_text_buffer_insert(buf, &end, text, -1);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
+    if (gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buf), "dim")) {
+        GtkTextIter s, e;
+        gtk_text_buffer_get_iter_at_offset(buf, &s, base);
+        gtk_text_buffer_get_iter_at_offset(buf, &e, base + (int)strlen(text));
+        gtk_text_buffer_apply_tag_by_name(buf, "dim", &s, &e);
+    }
 }
 
 /* Render a sector MCT-style: "Sector: N" header, one line per 16-byte block,
- * coloured (UID/keyA/ACs/keyB), and a blank line after. */
+ * coloured (UID/keyA/ACs/keyB/value). With show_acs, append dim notes decoding
+ * value blocks and the trailer's access conditions (read-only views only). */
 static void append_sector(GtkTextBuffer *buf, GtkWidget *view, int sec,
-                          const uint8_t *d, int n)
+                          const uint8_t *d, int n, int show_acs)
 {
     int has_tags = gtk_text_tag_table_lookup(gtk_text_buffer_get_tag_table(buf), "keyA") != NULL;
     GtkTextIter end;
@@ -198,16 +206,31 @@ static void append_sector(GtkTextBuffer *buf, GtkWidget *view, int sec,
         gtk_text_buffer_insert(buf, &end, "  ", -1);
         gtk_text_buffer_insert(buf, &end, hex, -1);
         gtk_text_buffer_insert(buf, &end, "\n", -1);
+        int is_trailer = (b == nblocks - 1);
+        int is_manuf = (sec == 0 && b == 0);
         if (has_tags) {
             int hs = base + 2;                 /* hex starts after the "  " indent */
-            if (sec == 0 && b == 0) {
+            if (is_manuf) {
                 tag_range(buf, hs, 0, 15 * 3 + 2, "uid");
-            } else if (b == nblocks - 1) {     /* sector trailer */
+            } else if (is_trailer) {
                 tag_range(buf, hs, 0,        5 * 3 + 2,  "keyA");
                 tag_range(buf, hs, 6 * 3,    9 * 3 + 2,  "acs");
                 tag_range(buf, hs, 10 * 3,   15 * 3 + 2, "keyB");
-            } else if (is_value_block(d + b * 16)) {   /* value block — yellow */
+            } else if (pmpro_value_block(d + b * 16, NULL, NULL)) {
                 tag_range(buf, hs, 0, 15 * 3 + 2, "value");
+            }
+        }
+        if (show_acs && is_trailer) {
+            char acs[256], note[300];
+            pmpro_decode_acs(d + b * 16, acs, sizeof acs);
+            snprintf(note, sizeof note, "    ACs: %s", acs);
+            append_dim(buf, note);
+        } else if (show_acs && !is_manuf) {
+            int32_t v; uint8_t ad;
+            if (pmpro_value_block(d + b * 16, &v, &ad)) {
+                char note[64];
+                snprintf(note, sizeof note, "    = value %d (addr %u)", v, ad);
+                append_dim(buf, note);
             }
         }
     }
@@ -237,13 +260,13 @@ static gboolean ui_apply(gpointer p)
     case K_TOAST:   adw_toast_overlay_add_toast(a->toasts, adw_toast_new(m->text)); break;
     case K_INFO:    gtk_label_set_text(GTK_LABEL(a->info_label), m->text); break;
     case K_HF:
-        if (m->is_sector) append_sector(a->hf_buf, a->hf_view, m->sector, m->sdata, m->sdlen);
+        if (m->is_sector) append_sector(a->hf_buf, a->hf_view, m->sector, m->sdata, m->sdlen, 1);
         else append_view(a->hf_buf, a->hf_view, m->text);
         break;
     case K_LFHID:   append_view(a->lfhid_buf, a->lfhid_view, m->text); break;
     case K_CRACK:   append_view(a->crack_buf, a->crack_view, m->text); break;
     case K_DUMP:
-        if (m->is_sector) append_sector(a->dump_buf, a->dump_view, m->sector, m->sdata, m->sdlen);
+        if (m->is_sector) append_sector(a->dump_buf, a->dump_view, m->sector, m->sdata, m->sdlen, 1);
         else append_view(a->dump_buf, a->dump_view, m->text);
         break;
     case K_CONSOLE: append_view(a->console_buf, a->console_view, m->text); break;
@@ -381,6 +404,8 @@ static gpointer w_read_hf(gpointer p)
             snprintf(a->last.uid, sizeof a->last.uid, "%s", ui.uid);
             a->have_last = TRUE;
             char kh[20]; pmpro_hex(a->cur_key, 6, kh, sizeof kh);
+            uint16_t atqa = c.tail_len >= 2 ? (c.tail[0] | (uint16_t)c.tail[1] << 8) : 0;
+            int sak0 = -1;             /* SAK from sector 0 block 0, when read */
             int open_sectors = 0;
             for (int s = 0; s < 16; s++) {
                 uint8_t blk[64], usekey[6];
@@ -405,6 +430,7 @@ static gpointer w_read_hf(gpointer p)
                 }
                 if (usetype >= 0) {
                     open_sectors++;
+                    if (s == 0) sak0 = blk[5];   /* block 0: UID·BCC·SAK·ATQA */
                     /* device masks keyA on read — restore the key we authenticated with */
                     if (usetype == 0) memcpy(blk + 48, usekey, 6);
                     else              memcpy(blk + 58, usekey, 6);
@@ -412,6 +438,11 @@ static gpointer w_read_hf(gpointer p)
                     pmpro_dump_add_block(&a->last, h);
                     post_sector(a, K_HF, s, blk, 64);
                 }
+            }
+            {
+                const char *ct = pmpro_card_type(sak0 >= 0 ? (uint8_t)sak0 : 0xFF, atqa, NULL);
+                post(a, K_HF, 1, "Type: %s", ct);
+                snprintf(a->last.card_type, sizeof a->last.card_type, "%s", ct);
             }
             if (!open_sectors)
                 post(a, K_HF, 0, "no sectors readable (tried key %s + dictionary). "
@@ -816,7 +847,7 @@ static void editor_reload(App *a)
     for (int i = 0; i < a->last.n_blocks; i++) {
         uint8_t d[256];
         int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
-        if (n > 0) append_sector(eb, a->edit_area, i, d, n);
+        if (n > 0) append_sector(eb, a->edit_area, i, d, n, 0);   /* editor: no notes */
     }
 }
 

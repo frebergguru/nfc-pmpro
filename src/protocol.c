@@ -81,3 +81,75 @@ void pmpro_decode_uid(const unsigned char *uid, size_t len, uid_info *out)
     pmpro_hex(uid, len, out->uid, sizeof out->uid);
     out->uid_len = (int)len;
 }
+
+const char *pmpro_card_type(uint8_t sak, uint16_t atqa, int *sectors)
+{
+    int s = 0;
+    const char *t;
+    switch (sak) {
+    case 0x08: t = "Mifare Classic 1K"; s = 16; break;
+    case 0x09: t = "Mifare Mini";       s = 5;  break;
+    case 0x18: t = "Mifare Classic 4K"; s = 40; break;
+    case 0x10: t = "Mifare Plus 2K";    s = 32; break;
+    case 0x11: t = "Mifare Plus 4K";    s = 40; break;
+    case 0x00: t = (atqa == 0x0044) ? "Mifare Ultralight / NTAG" : "Mifare Ultralight"; break;
+    case 0x20: t = "Mifare DESFire / Plus"; break;
+    case 0x28: t = "JCOP / SmartMX";    break;
+    default:
+        if      (atqa == 0x0004) { t = "Mifare Classic 1K"; s = 16; }
+        else if (atqa == 0x0002) { t = "Mifare Classic 4K"; s = 40; }
+        else                       t = "Unknown ISO14443A";
+        break;
+    }
+    if (sectors) *sectors = s;
+    return t;
+}
+
+int pmpro_value_block(const unsigned char b[16], int32_t *value, uint8_t *addr)
+{
+    if (memcmp(b, b + 8, 4) != 0)
+        return 0;
+    for (int i = 0; i < 4; i++)
+        if ((unsigned char)~b[i] != b[4 + i])
+            return 0;
+    if (b[12] != b[14] || b[13] != b[15] || (unsigned char)~b[12] != b[13])
+        return 0;
+    if (value)
+        *value = (int32_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 |
+                           (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24);
+    if (addr)
+        *addr = b[12];
+    return 1;
+}
+
+void pmpro_decode_acs(const unsigned char tr[16], char *out, size_t n)
+{
+    uint8_t b7 = tr[7], b8 = tr[8];
+    /* data-block access by (C1<<2|C2<<1|C3) */
+    static const char *db[8] = {
+        "rd A|B wr A|B",            /* 000 transport */
+        "rd A|B dec A|B (value)",   /* 001 */
+        "rd A|B wr never",          /* 010 read-only */
+        "rd B wr B",                /* 011 */
+        "rd A|B wr B",              /* 100 */
+        "rd B wr never",            /* 101 */
+        "rd A|B wr B inc/dec",      /* 110 */
+        "no access",                /* 111 */
+    };
+    /* trailer access by (C1<<2|C2<<1|C3) — keyB visibility + who writes keys */
+    static const char *tb[8] = {
+        "keyB readable; A writes keys",       /* 000 */
+        "transport; A writes keys+AC; keyB readable", /* 001 */
+        "keyB readable; keys locked",         /* 010 */
+        "B writes keys+AC",                   /* 011 */
+        "A reads AC; B writes keys",          /* 100 */
+        "AB read AC; B writes AC",            /* 101 */
+        "AB read AC; B writes keys+AC",       /* 110 */
+        "keys locked (no write)",             /* 111 */
+    };
+    int c[4];
+    for (int i = 0; i < 4; i++)
+        c[i] = (((b7 >> (4 + i)) & 1) << 2) | (((b8 >> i) & 1) << 1) | ((b8 >> (4 + i)) & 1);
+    snprintf(out, n, "blk0 %s; blk1 %s; blk2 %s; trailer %s",
+             db[c[0]], db[c[1]], db[c[2]], tb[c[3]]);
+}
