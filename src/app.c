@@ -58,8 +58,8 @@ typedef struct {
     char mfd_path[512];
 
     /* Dump tab */
-    GtkWidget *edit_block, *edit_hex;
-    GtkTextBuffer *dump_buf; GtkWidget *dump_view;
+    GtkWidget *edit_area;              /* editable hex editor for the buffer */
+    GtkTextBuffer *dump_buf; GtkWidget *dump_view;   /* read-only log */
 
     /* Console tab */
     GtkWidget *hex_entry;
@@ -675,6 +675,7 @@ static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
 /* ---- button callbacks (main thread) ------------------------------------ */
 
 static void settings_save(App *a);   /* fwd: defined with the settings code */
+static GtkWidget *scrolled(GtkWidget *child);   /* fwd: UI helper */
 
 static void on_connect(GtkButton *b, gpointer u) { (void)b; start_op(u, w_connect, NULL); }
 static void on_beep(GtkButton *b, gpointer u)    { (void)b; start_op(u, w_beep, NULL); }
@@ -791,6 +792,72 @@ static void on_nested(GtkButton *b, gpointer u) { (void)b; start_crack(u, 3); }
 
 /* ---- dump tab: file + edit + diff (main thread) ------------------------ */
 
+/* ---- editable hex editor (Dump tab) ----------------------------------- */
+
+/* render the buffer into the editable area (block-per-line, sector-spaced) */
+static void editor_reload(App *a)
+{
+    GtkTextBuffer *eb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->edit_area));
+    gtk_text_buffer_set_text(eb, "", -1);
+    for (int i = 0; i < a->last.n_blocks; i++) {
+        uint8_t d[256];
+        int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
+        if (n > 0) append_sector(eb, a->edit_area, i, d, n);
+    }
+}
+
+/* parse the editor back into the buffer: hex lines grouped by blank/header
+ * lines become one sector entry each. Metadata is preserved. */
+static int apply_editor(App *a)
+{
+    GtkTextBuffer *eb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->edit_area));
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(eb, &s, &e);
+    char *txt = gtk_text_buffer_get_text(eb, &s, &e, FALSE);
+    char **lines = g_strsplit(txt, "\n", -1);
+    a->last.n_blocks = 0;                       /* keep uid/type/freq/meta */
+    GString *grp = g_string_new(NULL);
+    for (char **lp = lines; *lp; lp++) {
+        const char *p = *lp;
+        while (*p == ' ' || *p == '\t') p++;
+        if (is_hexch(*p)) {                     /* a data line */
+            if (grp->len) g_string_append_c(grp, ' ');
+            g_string_append(grp, p);
+        } else if (grp->len) {                  /* blank/header → flush a sector */
+            uint8_t d[256];
+            int n = pmpro_parse_hex(grp->str, d, sizeof d);
+            if (n > 0) { char h[256]; pmpro_hex(d, n, h, sizeof h); pmpro_dump_add_block(&a->last, h); }
+            g_string_truncate(grp, 0);
+        }
+    }
+    if (grp->len) {
+        uint8_t d[256];
+        int n = pmpro_parse_hex(grp->str, d, sizeof d);
+        if (n > 0) { char h[256]; pmpro_hex(d, n, h, sizeof h); pmpro_dump_add_block(&a->last, h); }
+    }
+    g_string_free(grp, TRUE);
+    g_strfreev(lines);
+    g_free(txt);
+    a->have_last = a->last.n_blocks > 0;
+    return a->last.n_blocks;
+}
+
+static void on_editor_apply(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    int n = apply_editor(a);
+    post(a, K_DUMP, n > 0, "Applied editor → buffer (%d sector(s))", n);
+    post(a, K_TOAST, n > 0, n > 0 ? "Buffer updated from editor" : "Editor is empty");
+}
+
+static void on_editor_reload(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    if (!a->have_last) { toast(a, "Buffer empty — read or load a card first"); return; }
+    editor_reload(a);
+    post(a, K_TOAST, 1, "Editor reloaded from buffer");
+}
+
 static void on_save_finish(GObject *src, GAsyncResult *res, gpointer u)
 {
     App *a = u;
@@ -809,6 +876,7 @@ static void on_save_finish(GObject *src, GAsyncResult *res, gpointer u)
 static void on_save(GtkButton *b, gpointer u)
 {
     (void)b; App *a = u;
+    apply_editor(a);                 /* what you see in the editor is what you save */
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_set_initial_name(d, "card.pmdump");
     gtk_file_dialog_save(d, a->win, NULL, on_save_finish, a);
@@ -832,9 +900,34 @@ static void on_export_finish(GObject *src, GAsyncResult *res, gpointer u)
 static void on_export(GtkButton *b, gpointer u)
 {
     (void)b; App *a = u;
+    apply_editor(a);
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_set_initial_name(d, "card.mfd");
     gtk_file_dialog_save(d, a->win, NULL, on_export_finish, a);
+}
+
+static void on_save_keys_finish(GObject *src, GAsyncResult *res, gpointer u)
+{
+    App *a = u;
+    GFile *f = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(src), res, NULL);
+    if (!f) return;
+    char *path = g_file_get_path(f);
+    char err[128];
+    int n = pmpro_dump_save_keys(&a->last, path, err, sizeof err);
+    if (n >= 0) post(a, K_DUMP, 1, "Saved %d key(s) → %s", n, path);
+    else        toast(a, err);
+    g_free(path);
+    g_object_unref(f);
+}
+
+static void on_save_keys(GtkButton *b, gpointer u)
+{
+    (void)b; App *a = u;
+    apply_editor(a);
+    if (!a->have_last) { toast(a, "Buffer empty — load a dump first"); return; }
+    GtkFileDialog *d = gtk_file_dialog_new();
+    gtk_file_dialog_set_initial_name(d, "card.keys");
+    gtk_file_dialog_save(d, a->win, NULL, on_save_keys_finish, a);
 }
 
 static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
@@ -846,10 +939,11 @@ static void on_load_finish(GObject *src, GAsyncResult *res, gpointer u)
     char err[128];
     if (pmpro_dump_load(&a->last, path, err, sizeof err)) {
         a->have_last = TRUE;
+        editor_reload(a);
         post(a, K_DUMP, 1, "Loaded %s — %s / %s, UID %s, %d sector(s)%s%s",
              path, a->last.card_type, a->last.frequency, a->last.uid,
              a->last.n_blocks, a->last.meta[0] ? " — " : "", a->last.meta);
-        post(a, K_TOAST, 1, "Dump loaded into buffer");
+        post(a, K_TOAST, 1, "Dump loaded into editor");
     } else {
         post(a, K_DUMP, 0, "Load failed: %s", err);
         toast(a, err);
@@ -866,23 +960,10 @@ static void on_load(GtkButton *b, gpointer u)
     gtk_file_dialog_open(d, a->win, NULL, on_load_finish, a);
 }
 
-static void on_print_buffer(GtkButton *b, gpointer u)
-{
-    (void)b; App *a = u;
-    if (!a->have_last) { toast(a, "Buffer empty — read or load a card first"); return; }
-    post(a, K_DUMP, 1, "Buffer: %s / %s, UID %s, %d sector(s)%s%s",
-         a->last.card_type, a->last.frequency, a->last.uid, a->last.n_blocks,
-         a->last.meta[0] ? " — " : "", a->last.meta);
-    for (int i = 0; i < a->last.n_blocks; i++) {
-        uint8_t d[256];
-        int n = pmpro_parse_hex(a->last.blocks[i], d, sizeof d);
-        if (n > 0) post_sector(a, K_DUMP, i, d, n);
-    }
-}
-
 static void on_keys_from_dump(GtkButton *b, gpointer u)
 {
     (void)b; App *a = u;
+    apply_editor(a);
     if (!a->have_last || a->last.n_blocks == 0) { toast(a, "Buffer empty — load a dump first"); return; }
     static const uint8_t zero[6] = {0};
     int added = 0;
@@ -899,18 +980,125 @@ static void on_keys_from_dump(GtkButton *b, gpointer u)
     post(a, K_TOAST, 1, "Added %d keys to dictionary", added);
 }
 
-static void on_set_block(GtkButton *b, gpointer u)
+/* ---- Diff Tool window (byte-level, MCT-style) -------------------------- */
+
+typedef struct {
+    pmpro_dump A, B;          /* A = editor buffer, B = the file */
+    GtkWidget *view; GtkTextBuffer *buf;
+    GtkWidget *hide, *pct;
+} DiffCtx;
+
+/* one "A:"/"B:" block line; differing bytes (vs `other`) tagged red */
+static void diff_line(GtkTextBuffer *buf, const char *label,
+                      const uint8_t *d, int has, const uint8_t *other, int other_has)
 {
-    (void)b; App *a = u;
-    if (!a->have_last || a->last.n_blocks == 0) { toast(a, "Buffer empty — read or load a card first"); return; }
-    int idx = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(a->edit_block));
-    const char *hex = gtk_editable_get_text(GTK_EDITABLE(a->edit_hex));
-    if (pmpro_dump_set_block(&a->last, idx, hex)) {
-        post(a, K_DUMP, 1, "Edited block %d → %s", idx, a->last.blocks[idx]);
-        post(a, K_TOAST, 1, "Block %d updated", idx);
-    } else {
-        post(a, K_DUMP, 0, "Edit failed: index 0..%d, valid hex (≤64 bytes)", a->last.n_blocks - 1);
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(buf, &end);
+    int base = gtk_text_iter_get_offset(&end);
+    gtk_text_buffer_insert(buf, &end, label, -1);
+    if (!has) { gtk_text_buffer_insert(buf, &end, "(missing)\n", -1); return; }
+    char hex[64];
+    pmpro_hex(d, 16, hex, sizeof hex);
+    int hb = base + (int)strlen(label);
+    gtk_text_buffer_insert(buf, &end, hex, -1);
+    gtk_text_buffer_insert(buf, &end, "\n", -1);
+    for (int i = 0; i < 16; i++) {
+        if (!other_has || d[i] != other[i]) {
+            GtkTextIter s, e;
+            gtk_text_buffer_get_iter_at_offset(buf, &s, hb + i * 3);
+            gtk_text_buffer_get_iter_at_offset(buf, &e, hb + i * 3 + 2);
+            gtk_text_buffer_apply_tag_by_name(buf, "d", &s, &e);
+        }
     }
+}
+
+static void diff_render(DiffCtx *c, gboolean hide_identical)
+{
+    gtk_text_buffer_set_text(c->buf, "", -1);
+    long total = 0, diff = 0;
+    int nsec = c->A.n_blocks > c->B.n_blocks ? c->A.n_blocks : c->B.n_blocks;
+    for (int i = 0; i < nsec; i++) {
+        uint8_t ad[256], bd[256];
+        int an = i < c->A.n_blocks ? pmpro_parse_hex(c->A.blocks[i], ad, sizeof ad) : 0;
+        int bn = i < c->B.n_blocks ? pmpro_parse_hex(c->B.blocks[i], bd, sizeof bd) : 0;
+        int nb = (an > bn ? an : bn) / 16;
+        int sdiff = an != bn;
+        for (int k = 0; k < nb * 16; k++) {
+            int av = k < an, bv = k < bn;
+            total++;
+            if (av != bv || (av && bv && ad[k] != bd[k])) { diff++; sdiff = 1; }
+        }
+        if (hide_identical && !sdiff) continue;
+        GtkTextIter end;
+        char hdr[32]; snprintf(hdr, sizeof hdr, "Sector: %d\n", i);
+        gtk_text_buffer_get_end_iter(c->buf, &end);
+        gtk_text_buffer_insert(c->buf, &end, hdr, -1);
+        for (int b = 0; b < nb; b++) {
+            const uint8_t *ab = (b * 16 < an) ? ad + b * 16 : NULL;
+            const uint8_t *bb = (b * 16 < bn) ? bd + b * 16 : NULL;
+            diff_line(c->buf, "  A: ", ab, ab != NULL, bb, bb != NULL);
+            diff_line(c->buf, "  B: ", bb, bb != NULL, ab, ab != NULL);
+        }
+        gtk_text_buffer_get_end_iter(c->buf, &end);
+        gtk_text_buffer_insert(c->buf, &end, "\n", -1);
+    }
+    char lbl[64];
+    snprintf(lbl, sizeof lbl, "Difference: %.2f%%", total ? 100.0 * diff / total : 0.0);
+    gtk_label_set_text(GTK_LABEL(c->pct), lbl);
+}
+
+static void on_diff_hide(GtkCheckButton *b, gpointer u)
+{
+    diff_render((DiffCtx *)u, gtk_check_button_get_active(b));
+}
+
+static void on_diff_destroy(GtkWidget *w, gpointer u) { (void)w; g_free(u); }
+
+static void open_diff_window(App *a, const pmpro_dump *B, const char *path)
+{
+    DiffCtx *c = g_new0(DiffCtx, 1);
+    c->A = a->last;       /* struct copy */
+    c->B = *B;
+
+    GtkWidget *win = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(win), "Diff Tool");
+    gtk_window_set_transient_for(GTK_WINDOW(win), a->win);
+    gtk_window_set_default_size(GTK_WINDOW(win), 900, 720);
+
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(box, 12); gtk_widget_set_margin_end(box, 12);
+    gtk_widget_set_margin_top(box, 12); gtk_widget_set_margin_bottom(box, 12);
+
+    char hdr[600];
+    snprintf(hdr, sizeof hdr, "A = editor buffer (UID %s)\nB = %s", a->last.uid, path);
+    GtkWidget *hl = gtk_label_new(hdr);
+    gtk_label_set_xalign(GTK_LABEL(hl), 0);
+    gtk_label_set_wrap(GTK_LABEL(hl), TRUE);
+    gtk_box_append(GTK_BOX(box), hl);
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    c->pct = gtk_label_new("Difference: …");
+    gtk_widget_add_css_class(c->pct, "heading");
+    gtk_box_append(GTK_BOX(row), c->pct);
+    c->hide = gtk_check_button_new_with_label("Hide identical sectors");
+    g_signal_connect(c->hide, "toggled", G_CALLBACK(on_diff_hide), c);
+    gtk_box_append(GTK_BOX(row), c->hide);
+    gtk_box_append(GTK_BOX(box), row);
+
+    c->view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(c->view), FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(c->view), TRUE);
+    gtk_widget_set_margin_start(c->view, 8); gtk_widget_set_margin_end(c->view, 8);
+    gtk_widget_set_margin_top(c->view, 8); gtk_widget_set_margin_bottom(c->view, 8);
+    c->buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(c->view));
+    gtk_text_buffer_create_tag(c->buf, "d", "foreground", "#e01b24",
+                               "weight", PANGO_WEIGHT_BOLD, NULL);
+    gtk_box_append(GTK_BOX(box), scrolled(c->view));
+
+    gtk_window_set_child(GTK_WINDOW(win), box);
+    g_signal_connect(win, "destroy", G_CALLBACK(on_diff_destroy), c);
+    diff_render(c, FALSE);
+    gtk_window_present(GTK_WINDOW(win));
 }
 
 static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
@@ -921,18 +1109,10 @@ static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
     char *path = g_file_get_path(f);
     pmpro_dump *other = g_new0(pmpro_dump, 1);
     char err[128];
-    if (pmpro_dump_load(other, path, err, sizeof err)) {
-        char *buf = g_malloc(16384);
-        int n = pmpro_dump_diff(&a->last, other, buf, 16384);
-        post(a, K_DUMP, n == 0, "Diff: buffer vs %s — %d difference(s)", path, n);
-        char **lines = g_strsplit(buf, "\n", -1);
-        for (char **p = lines; *p; p++)
-            if (**p) post(a, K_DUMP, 1, "  %s", *p);
-        g_strfreev(lines);
-        g_free(buf);
-    } else {
+    if (pmpro_dump_load(other, path, err, sizeof err))
+        open_diff_window(a, other, path);
+    else
         toast(a, err);
-    }
     g_free(other);
     g_free(path);
     g_object_unref(f);
@@ -941,6 +1121,7 @@ static void on_diff_finish(GObject *src, GAsyncResult *res, gpointer u)
 static void on_diff(GtkButton *b, gpointer u)
 {
     (void)b; App *a = u;
+    apply_editor(a);
     if (!a->have_last) { toast(a, "Buffer empty — read or load a card first"); return; }
     GtkFileDialog *d = gtk_file_dialog_new();
     gtk_file_dialog_open(d, a->win, NULL, on_diff_finish, a);
@@ -1350,36 +1531,59 @@ static GtkWidget *page_dump(App *a)
     GtkWidget *box = page_box();
 
     gtk_box_append(GTK_BOX(box), section_label("Dump file"));
-    gtk_box_append(GTK_BOX(box), hint_label(
-        "The buffer holds the last card read (HF tab) or loaded here. Save as text "
-        ".pmdump or raw binary .mfd; Load auto-detects either."));
     GtkWidget *r0 = hrow();
     gtk_box_append(GTK_BOX(r0), btn("Load…", "suggested-action", G_CALLBACK(on_load), a));
     gtk_box_append(GTK_BOX(r0), btn("Save .pmdump…", NULL, G_CALLBACK(on_save), a));
     gtk_box_append(GTK_BOX(r0), btn("Export .mfd…", NULL, G_CALLBACK(on_export), a));
-    gtk_box_append(GTK_BOX(r0), btn("Show buffer", NULL, G_CALLBACK(on_print_buffer), a));
+    gtk_box_append(GTK_BOX(box), r0);
+
+    GtkWidget *rk = hrow();
+    gtk_box_append(GTK_BOX(rk), gtk_label_new("Keys:"));
+    GtkWidget *lk = btn("Import .keys…", NULL, G_CALLBACK(on_load_keys), a);
+    gtk_widget_set_tooltip_text(lk, "Load a MifareClassicTool .keys file into the "
+        "dictionary (also on the Crack tab; remembered across launches)");
+    gtk_box_append(GTK_BOX(rk), lk);
+    GtkWidget *sk = btn("Save .keys…", NULL, G_CALLBACK(on_save_keys), a);
+    gtk_widget_set_tooltip_text(sk, "Write this dump's Key A/Key B values to a "
+        ".keys file (MifareClassicTool format)");
+    gtk_box_append(GTK_BOX(rk), sk);
     GtkWidget *k2d = btn("Keys → dict", NULL, G_CALLBACK(on_keys_from_dump), a);
     gtk_widget_set_tooltip_text(k2d, "Add this dump's trailer keys to the dictionary "
         "so Read HF (and the Crack tab) can use them");
-    gtk_box_append(GTK_BOX(r0), k2d);
-    gtk_box_append(GTK_BOX(box), r0);
+    gtk_box_append(GTK_BOX(rk), k2d);
+    gtk_box_append(GTK_BOX(box), rk);
 
-    gtk_box_append(GTK_BOX(box), section_label("Edit / compare"));
+    gtk_box_append(GTK_BOX(box), section_label("Hex editor"));
+    gtk_box_append(GTK_BOX(box), hint_label(
+        "Click anywhere and type to edit bytes directly — one block (16 bytes) per "
+        "line, a blank line between sectors. \"Apply edits\" writes the editor back "
+        "to the buffer (Save / Export / Diff / key actions apply it automatically)."));
     GtkWidget *r1 = hrow();
-    gtk_box_append(GTK_BOX(r1), gtk_label_new("Block"));
-    a->edit_block = gtk_spin_button_new_with_range(0, PMPRO_MAX_BLOCKS - 1, 1);
-    gtk_box_append(GTK_BOX(r1), a->edit_block);
-    a->edit_hex = entry_exp("new block hex (≤64 bytes)");
-    gtk_box_append(GTK_BOX(r1), a->edit_hex);
-    gtk_box_append(GTK_BOX(r1), btn("Set block", NULL, G_CALLBACK(on_set_block), a));
+    gtk_box_append(GTK_BOX(r1), btn("Apply edits", "suggested-action", G_CALLBACK(on_editor_apply), a));
+    gtk_box_append(GTK_BOX(r1), btn("Reload from buffer", NULL, G_CALLBACK(on_editor_reload), a));
     gtk_box_append(GTK_BOX(r1), btn("Diff vs file…", NULL, G_CALLBACK(on_diff), a));
     gtk_box_append(GTK_BOX(box), r1);
 
-    GtkWidget *dv = mono_view(&a->dump_buf,
-        "Load a .pmdump or .mfd, or read a card on the HF/LF tab, then Show buffer.\n");
+    a->edit_area = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(a->edit_area), TRUE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(a->edit_area), TRUE);
+    gtk_widget_set_margin_start(a->edit_area, 8); gtk_widget_set_margin_end(a->edit_area, 8);
+    gtk_widget_set_margin_top(a->edit_area, 8); gtk_widget_set_margin_bottom(a->edit_area, 8);
+    GtkTextBuffer *eb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(a->edit_area));
+    buf_add_tags(eb);
+    gtk_text_buffer_set_text(eb,
+        "Load a dump, or read a card then \"Reload from buffer\", to edit here.\n", -1);
+    gtk_box_append(GTK_BOX(box), scrolled(a->edit_area));
+
+    /* small read-only log for messages + diff output */
+    GtkWidget *dv = mono_view(&a->dump_buf, NULL);
     a->dump_view = dv;
     buf_add_tags(a->dump_buf);
-    gtk_box_append(GTK_BOX(box), scrolled(dv));
+    GtkWidget *logsc = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(logsc), dv);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(logsc), 110);
+    gtk_widget_set_hexpand(logsc, TRUE);
+    gtk_box_append(GTK_BOX(box), logsc);
     return box;
 }
 

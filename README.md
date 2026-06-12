@@ -19,9 +19,12 @@ software, no Wine needed at runtime.
 - **Save / Load dump** — save a read card to a `.pmdump`, or load one back into
   the buffer to write to a blank. Load auto-detects raw binary `.mfd` dumps
   (e.g. autopwn output, or libnfc/Proxmark dumps) as well as `.pmdump`.
-- **Edit / diff dumps** — edit a block of the buffer and diff it against another
-  dump (GUI Dump tab, or `pmctl dumpset <file> <blk> <hex>` /
-  `pmctl dumpdiff <a> <b>` / `pmctl dumpconv <in> <out>` offline).
+- **Edit / diff dumps** — the GUI Dump tab has an editable hex editor (click and
+  type, one block per line, colour-coded), and a byte-level **Diff Tool** window
+  (per-byte highlighting, % difference, hide-identical), à la MifareClassicTool.
+  Offline: `pmctl dumpset <file> <blk> <hex>` / `dumpdiff <a> <b>` / `dumpconv <in> <out>`.
+- **Import / export `.keys`** — Dump tab (or Crack tab): import a `.keys`
+  dictionary, or save a dump's recovered Key A/Key B values to a `.keys` file.
 - **Import .keys** — load MifareClassicTool-style `.keys` dictionaries (GUI
   Crack tab "Load keys…", or `pmctl dict <blk> <type> <file>`); the keys extend
   the dictionary used by Dictionary/Nested/Autopwn.

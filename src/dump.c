@@ -140,6 +140,39 @@ bool pmpro_dump_save_auto(const pmpro_dump *d, const char *path, char *err, size
     return pmpro_dump_save(d, path, err, n);
 }
 
+int pmpro_dump_save_keys(const pmpro_dump *d, const char *path, char *err, size_t n)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) { snprintf(err, n, "cannot write %s", path); return -1; }
+    fprintf(f, "# Mifare keys from %s (UID %s) — MifareClassicTool format\n",
+            d->card_type[0] ? d->card_type : "dump", d->uid);
+
+    unsigned char keys[2 * PMPRO_MAX_BLOCKS][6];
+    int nk = 0;
+    static const unsigned char zero[6] = {0};
+    for (int i = 0; i < d->n_blocks; i++) {
+        unsigned char b[256];
+        int len = pmpro_parse_hex(d->blocks[i], b, sizeof b);
+        if (len < 16) continue;
+        int tr = ((len / 16) - 1) * 16;            /* trailer = last block */
+        const unsigned char *cand[2] = { b + tr, b + tr + 10 };  /* keyA, keyB */
+        for (int c = 0; c < 2; c++) {
+            if (!memcmp(cand[c], zero, 6)) continue;            /* skip empty */
+            int dup = 0;
+            for (int k = 0; k < nk; k++)
+                if (!memcmp(keys[k], cand[c], 6)) { dup = 1; break; }
+            if (!dup && nk < (int)(sizeof keys / 6)) {
+                memcpy(keys[nk++], cand[c], 6);
+                fprintf(f, "%02X%02X%02X%02X%02X%02X\n", cand[c][0], cand[c][1],
+                        cand[c][2], cand[c][3], cand[c][4], cand[c][5]);
+            }
+        }
+    }
+    fclose(f);
+    if (err && n) err[0] = '\0';
+    return nk;
+}
+
 static void rstrip(char *s)
 {
     size_t len = strlen(s);

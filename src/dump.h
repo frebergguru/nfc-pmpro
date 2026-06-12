@@ -53,6 +53,11 @@ bool pmpro_dump_save_mfd(const pmpro_dump *d, const char *path, char *err, size_
 /* Save dispatching on the path's extension: ".mfd" -> raw binary, else text. */
 bool pmpro_dump_save_auto(const pmpro_dump *d, const char *path, char *err, size_t n);
 
+/* Write the dump's unique trailer Key A / Key B values to a MifareClassicTool
+ * .keys file (one 12-hex key per line). Returns the number of keys written, or
+ * -1 on error (err, size n). */
+int pmpro_dump_save_keys(const pmpro_dump *d, const char *path, char *err, size_t n);
+
 /* Load auto-detecting text .pmdump vs raw binary .mfd. */
 bool pmpro_dump_load(pmpro_dump *d, const char *path, char *err, size_t n);
 
