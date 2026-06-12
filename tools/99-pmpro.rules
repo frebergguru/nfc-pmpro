@@ -1,0 +1,12 @@
+# FURUI NFC PM-Pro (FR-RATEL) — grant the logged-in desktop user access to the
+# device's raw HID command interface without root.
+#
+# Install:
+#   sudo cp tools/99-pmpro.rules /etc/udev/rules.d/99-pmpro.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then unplug and replug the device
+#
+# VID:PID = 1629:1831, iProduct "FR-RATEL". Interface 0 is the vendor HID
+# command channel (64-byte interrupt reports), exposed as /dev/hidrawN.
+
+KERNEL=="hidraw*", ATTRS{idVendor}=="1629", ATTRS{idProduct}=="1831", MODE="0660", GROUP="plugdev", TAG+="uaccess"

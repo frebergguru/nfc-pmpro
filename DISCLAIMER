@@ -1,0 +1,28 @@
+DISCLAIMER & RESPONSIBLE USE
+============================
+
+This software operates a FURUI NFC PM-Pro (FR-RATEL) RFID reader/writer and can
+read, write, clone, and recover keys from 125 kHz and 13.56 MHz (Mifare Classic)
+cards. It is provided for:
+
+  * interoperability with hardware you own,
+  * administration of access systems you operate,
+  * security research and education, and
+  * authorized penetration testing.
+
+USE IT ONLY on cards, fobs, and systems that you own or are explicitly
+authorized to test. Reading, cloning, or modifying credentials you do not own or
+are not authorized to access may be illegal in your jurisdiction.
+
+The protocol details were determined by clean-room reverse engineering for
+interoperability; they document functional facts about the device's wire
+protocol. Legal treatment of reverse engineering, anti-circumvention, and
+security tooling varies by country — you are responsible for compliance with the
+laws that apply to you.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. The authors are
+not liable for any damage, data loss, bricked devices, or misuse. Writing to
+cards (especially sector trailers / UID blocks) can render them unusable.
+
+By using this software you accept these terms and full responsibility for how
+you use it.

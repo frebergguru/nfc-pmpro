@@ -1,0 +1,31 @@
+NFC PM-Pro companion — third-party components & provenance
+==========================================================
+
+This project is licensed under the GNU General Public License v3.0 (see LICENSE),
+because it includes the GPL-licensed Crypto-1 components below.
+
+Bundled open-source components
+------------------------------
+* src/crypto1.c
+    Port of "crapto1" — Crypto-1 cipher and LFSR key recovery.
+    Copyright (C) 2008-2014 bla <blapost@gmail.com>
+    Copyright (C) Proxmark3 contributors.
+    GPLv3. Upstream: github.com/RfidResearchGroup/proxmark3 (common/crapto1).
+
+* src/hardnested/
+    Vendored "mfoc-hardnested" — Mifare hardnested solver (cmdhfmfhard.c,
+    hardnested/*, crapto1.c, crypto1.c, parity, ui, util, bucketsort).
+    Copyright (C) 2015 piwi and Proxmark3 / nfc-tools contributors.
+    GPLv2-or-later / GPLv3. Upstream: github.com/nfc-tools/mfoc-hardnested.
+    Decoupled from libnfc here: only the nonce-acquisition function was
+    replaced by a PM-Pro collection hook; the solver is unchanged.
+
+Original work
+-------------
+* All other source under src/ is original, written from the protocol
+  description in PROTOCOL.md. PROTOCOL.md documents facts about the FURUI
+  NFC PM-Pro (FR-RATEL) wire protocol determined by clean-room reverse
+  engineering for interoperability. No decompiled vendor code is included in
+  this repository.
+
+See DISCLAIMER for intended/authorized use.
