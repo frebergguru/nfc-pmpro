@@ -18,7 +18,7 @@
 
 #define PMPRO_MAX_BLOCKS 256
 #define PMPRO_MAX_KEYS 64
-#define PMPRO_LINE 128
+#define PMPRO_LINE 256     /* must fit a 64-byte sector in hex (191 chars) */
 
 typedef struct {
     char card_type[32];

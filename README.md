@@ -14,7 +14,8 @@ software, no Wine needed at runtime.
 - **Read / Write LF** (125 kHz, EM4100/T5577/EM4305) and **HID prox** (read/write).
   LF reads decode the EM4100 customer/card number + fob text.
 - **Save / Load dump** — save a read card to a `.pmdump`, or load one back into
-  the buffer to write to a blank.
+  the buffer to write to a blank. Load auto-detects raw binary `.mfd` dumps
+  (e.g. autopwn output, or libnfc/Proxmark dumps) as well as `.pmdump`.
 - **Edit / diff dumps** — edit a block of the buffer and diff it against another
   `.pmdump` (GUI Write tab, or `pmctl dumpset <file> <blk> <hex>` /
   `pmctl dumpdiff <a> <b>` offline).

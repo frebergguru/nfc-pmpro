@@ -2,6 +2,7 @@
 #include "protocol.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void pmpro_dump_init(pmpro_dump *d)
@@ -95,13 +96,8 @@ static void rstrip(char *s)
         s[--len] = '\0';
 }
 
-bool pmpro_dump_load(pmpro_dump *d, const char *path, char *err, size_t n)
+static void dump_load_text(pmpro_dump *d, FILE *f)
 {
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        snprintf(err, n, "cannot read %s", path);
-        return false;
-    }
     pmpro_dump_init(d);
     char line[512];
     while (fgets(line, sizeof line, f)) {
@@ -127,6 +123,67 @@ bool pmpro_dump_load(pmpro_dump *d, const char *path, char *err, size_t n)
         else if (strcmp(line, "key") == 0)
             pmpro_dump_add_key(d, val);
     }
+}
+
+/* Raw Mifare Classic dump (.mfd): contiguous 16-byte blocks. Stored one
+ * 64-byte sector per block entry to match the read/clone buffer (sectors 0..31
+ * are 4 blocks; 4K sectors 32+ are 16 blocks). */
+static bool dump_load_mfd(pmpro_dump *d, const uint8_t *raw, size_t n)
+{
+    if (n < 64 || n % 16)
+        return false;
+    pmpro_dump_init(d);
+    snprintf(d->card_type, sizeof d->card_type, "Mifare Classic %dK",
+             n > 1024 ? 4 : 1);
+    snprintf(d->frequency, sizeof d->frequency, "13.56MHz");
+    pmpro_hex(raw, 4, d->uid, sizeof d->uid);     /* UID from block 0 */
+    int total = (int)(n / 16);
+    int blk = 0, sec = 0;
+    while (blk < total) {
+        int bib = sec < 32 ? 4 : 16;              /* blocks in this sector */
+        if (blk + bib > total) bib = total - blk;
+        char h[PMPRO_LINE];
+        pmpro_hex(raw + blk * 16, (size_t)bib * 16, h, sizeof h);
+        if (!pmpro_dump_add_block(d, h))
+            break;
+        blk += bib;
+        sec++;
+    }
+    return d->n_blocks > 0;
+}
+
+bool pmpro_dump_load(pmpro_dump *d, const char *path, char *err, size_t n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(err, n, "cannot read %s", path);
+        return false;
+    }
+    unsigned char head[2] = {0, 0};
+    size_t hn = fread(head, 1, sizeof head, f);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+
+    /* our text dumps start with "# "; otherwise a known Mifare size is raw .mfd */
+    int is_text = (hn >= 2 && head[0] == '#' && head[1] == ' ');
+    int is_mfd = !is_text && (sz == 320 || sz == 1024 || sz == 2048 || sz == 4096);
+
+    bool ok = true;
+    if (is_mfd) {
+        uint8_t *buf = malloc((size_t)sz);
+        if (!buf) { fclose(f); snprintf(err, n, "out of memory"); return false; }
+        ok = fread(buf, 1, (size_t)sz, f) == (size_t)sz && dump_load_mfd(d, buf, (size_t)sz);
+        free(buf);
+        if (!ok) snprintf(err, n, "not a recognizable Mifare dump (%ld bytes)", sz);
+    } else {
+        dump_load_text(d, f);
+        if (d->n_blocks == 0 && d->uid[0] == '\0') {
+            snprintf(err, n, "%s is not a valid .pmdump or .mfd dump", path);
+            ok = false;
+        }
+    }
     fclose(f);
-    return true;
+    if (ok && err && n) err[0] = '\0';
+    return ok;
 }
