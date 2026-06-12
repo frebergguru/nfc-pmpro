@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Embeds the app icon so it shows even when run from the build tree (not just
+     after a system install). Registered onto the icon theme in app.c. -->
+<gresources>
+  <gresource prefix="/com/furui/pmpro/icons/scalable/apps">
+    <file>com.furui.pmpro.svg</file>
+  </gresource>
+</gresources>

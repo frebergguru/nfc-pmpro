@@ -2670,8 +2670,18 @@ static void activate(GtkApplication *gapp, gpointer user)
 {
     App *a = user;
     load_css();
+
+    /* Make the embedded app icon available to the icon theme (the GResource is
+     * auto-registered at load), so the window/taskbar icon shows even when run
+     * from the build tree — not only after a system install. */
+    gtk_icon_theme_add_resource_path(
+        gtk_icon_theme_get_for_display(gdk_display_get_default()),
+        "/com/furui/pmpro/icons");
+    gtk_window_set_default_icon_name(APP_ID);
+
     GtkWidget *win = adw_application_window_new(gapp);
     a->win = GTK_WINDOW(win);
+    gtk_window_set_icon_name(GTK_WINDOW(win), APP_ID);
     gtk_window_set_title(GTK_WINDOW(win), "NFC PM-Pro");
     gtk_window_set_default_size(GTK_WINDOW(win), 1320, 700);
     /* keep the window wide enough that the 7-tab view switcher shows full labels */

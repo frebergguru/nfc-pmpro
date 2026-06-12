@@ -44,6 +44,19 @@ set_source_files_properties(
     ${HN}/hardnested/hardnested_bf_core_AVX512.c ${HN}/hardnested/hardnested_bitarray_core_AVX512.c
     PROPERTIES COMPILE_OPTIONS "-mmmx;-msse2;-mavx;-mavx2;-mavx512f")
 
+# ---- embed the app icon as a GResource (so it shows when run uninstalled) ----
+find_program(GLIB_COMPILE_RESOURCES glib-compile-resources REQUIRED)
+set(ICON_GRESOURCE ${CMAKE_BINARY_DIR}/icon_resources.c)
+add_custom_command(
+    OUTPUT ${ICON_GRESOURCE}
+    COMMAND ${GLIB_COMPILE_RESOURCES}
+            --target=${ICON_GRESOURCE} --generate-source
+            --sourcedir=${CMAKE_SOURCE_DIR}/data
+            ${CMAKE_SOURCE_DIR}/data/icons.gresource.xml
+    DEPENDS ${CMAKE_SOURCE_DIR}/data/icons.gresource.xml
+            ${CMAKE_SOURCE_DIR}/data/com.furui.pmpro.svg
+    COMMENT "Compiling icon GResource")
+
 add_executable(pmpro
     src/app.c
     src/hidraw.c
@@ -55,7 +68,8 @@ add_executable(pmpro
     src/hardnested_glue.c
     src/nested.c
     src/dump.c
-    src/ndef.c)
+    src/ndef.c
+    ${ICON_GRESOURCE})
 
 target_include_directories(pmpro PRIVATE ${ADW_INCLUDE_DIRS} src)
 target_link_directories(pmpro PRIVATE ${ADW_LIBRARY_DIRS})
