@@ -5,6 +5,22 @@ USB `1629:1831`) RFID reader/writer/copier — built in C with a GTK4/libadwaita
 talking to the device over its native (reverse-engineered) HID protocol. No vendor
 software, no Wine needed at runtime.
 
+## Screenshots
+
+The **HF · Mifare** tab — read a card with a key, write/format a sector, clone to a
+blank, and whole-card tag operations:
+
+![HF · Mifare tab](Screenshots/hf-mifare.png)
+
+| | |
+|---|---|
+| **Device** — connect, identify, beep | **Crack** — dictionary / nested / darkside / hardnested + autopwn |
+| ![Device tab](Screenshots/device.png) | ![Crack tab](Screenshots/crack.png) |
+| **LF · HID** — 125 kHz EM4100/T5577 + HID prox | **Dump** — load/save/export, hex editor, diff |
+| ![LF · HID tab](Screenshots/lf-hid.png) | ![Dump tab](Screenshots/dump.png) |
+| **Console** — send raw protocol payloads | |
+| ![Console tab](Screenshots/console.png) | |
+
 ## What works (all verified on real hardware unless noted)
 - **Connect** — identify + RC4 handshake.
 - **Identify tag** — one button (Device page) / `pmctl identify` that auto-detects
@@ -83,8 +99,21 @@ The protocol (RC4 + CRC-16/CCITT + framing, full command table) is documented in
 > (`ctest`).
 
 ## Build
-Needs `gtk4`, `libadwaita`, a C compiler, CMake/Ninja. The device I/O is pure
-`/dev/hidraw` — no libusb/hidapi.
+Needs GTK4 + libadwaita, `liblzma`, a C compiler, and CMake/Ninja. The device I/O
+is pure `/dev/hidraw` — no libusb/hidapi.
+
+Install the dependencies:
+```sh
+# Arch / Manjaro
+sudo pacman -S --needed base-devel cmake ninja gtk4 libadwaita xz
+
+# Debian / Ubuntu
+sudo apt install build-essential cmake ninja-build libgtk-4-dev libadwaita-1-dev liblzma-dev pkg-config
+
+# Fedora
+sudo dnf install gcc cmake ninja-build gtk4-devel libadwaita-devel xz-devel pkgconf
+```
+Then build:
 ```sh
 cmake -G Ninja -S . -B build && ninja -C build
 ./build/pmpro           # GUI
@@ -114,6 +143,11 @@ sudo cp tools/99-pmpro.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 - `src/app.c` — GTK4/libadwaita GUI. `src/pmctl.c` — CLI. `src/probe.c` — RE probe.
 - `tests/` — Crypto-1 + dump/protocol self-tests (`ctest`).
 - `data/` — `.desktop` launcher + icon. `tools/99-pmpro.rules` — udev rule.
+
+## Contributing
+Patches welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for build/test setup, code
+style, how to verify protocol changes against the device, and the GPLv3 / no-vendor-code
+ground rules.
 
 ## Responsible use
 This device and app read/write/clone RFID/NFC cards and include Mifare key-recovery.
