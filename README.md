@@ -97,9 +97,11 @@ blank, and whole-card tag operations:
   stored via the MAD + NDEF mapping (NDEF key `D3F7D3F7D3F7`), so **Android phones
   read them** (iOS does not read NDEF on Mifare Classic). This device has no
   Ultralight/NTAG page write, so NDEF goes on Classic only — and because the MAD
-  lives in sector 0, a **magic (gen2/CUID) card** is needed for a phone-readable
-  tag (on a genuine card block 0 is read-only, so the data sectors get written but
-  the MAD doesn't — verified on hardware). CLI:
+  lives in sector 0, a **magic (gen2/CUID) card** is needed to *format* a
+  phone-readable tag (on a genuine card block 0 is read-only, so the data sectors
+  get written but the MAD doesn't — verified on hardware). An **already-NDEF-formatted
+  card can still be (re)written** — the existing MAD is kept and only the data
+  sectors are updated (so a card formatted by a phone can be edited here). CLI:
   `pmctl ndefencode <type> …` (offline preview), `pmctl ndefwrite <type> …`,
   `pmctl ndefread`.
 - **Card insight** — card-type detection (SAK/ATQA), decoded access conditions
@@ -164,7 +166,7 @@ sudo cp tools/99-pmpro.rules /etc/udev/rules.d/ && sudo udevadm control --reload
 - `src/dump.[ch]` — `.pmdump` / `.mfd` / `.keys` load · save · diff.
 - `src/ndef.[ch]` — NDEF records (encode/decode) + the Mifare Classic NDEF mapping.
 - `src/app.c` — GTK4/libadwaita GUI. `src/pmctl.c` — CLI. `src/probe.c` — RE probe.
-- `tests/` — Crypto-1 + dump/protocol self-tests (`ctest`).
+- `tests/` — Crypto-1, dump/protocol, and NDEF self-tests (`ctest`).
 - `data/` — `.desktop` launcher + icon. `tools/99-pmpro.rules` — udev rule.
 
 ## Contributing

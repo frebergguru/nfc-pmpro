@@ -46,7 +46,7 @@ Payloads below are the plaintext **before** framing+encryption.
 | `29` | read HID prox        | `29`                                             | |
 | `2D` | write LF ID          | `2D <Freq> <CardID×4> <PlantID>`                 | T5577/EM4305 |
 | `2E` | write HID prox       | `2E <CardID×12>`                                 | |
-| `10` | activate HF card     | `10`                                             | precedes sector ops |
+| `10` | activate HF card     | `10`                                             | precedes sector ops. One select suffices — `17` reads chain after a single `10` (verified); a failed auth halts the card, so re-select before the next read |
 | `13` | check keys (auth)    | `13 <block> <type> <count> <key×6…>`             | tries the key list; resp payload = the key that authenticated (dictionary attack + verifier) |
 | `14` | nested collect       | `14 <fBlock> <fType> <fKey×6> <tBlock> <tType> <DevRandom×4>` (after cmd `10`) | foothold→target nonces: header(uid…) + 15 foothold pairs + 8 target `nt(4) NtEnc(4) par(3)` records. Nonces **little-endian**; the cipher authuid is **big-endian**. Intermittent — retry |
 | `15` | darkside collect     | `15 <attBlock> <attType>`                        | resp payload = uid + nonce records (3 bytes only on hardened cards) |
@@ -90,9 +90,11 @@ a whole-sector `18` to sector 0 includes the read-only block 0, so the firmware 
 it and the sector-0 trailer key never changes. Since the device has no authenticated
 single-block write (only whole-sector `18` and format `16`), **the MAD can only be
 written on a magic (gen2/CUID) card**. Without the MAD a phone won't find the NDEF
-sectors, so phone-readable NDEF requires a magic card; on a genuine card only the data
-half lands (this app's own `ndefread` still reads it, as it scans the data sectors
-directly).
+sectors, so *formatting* a phone-readable tag requires a magic card; on a blank genuine
+card only the data half lands (this app's own `ndefread` still reads it, as it scans the
+data sectors directly). An **already-NDEF-formatted genuine card can still be updated** —
+the writer detects the existing MAD (AID `03 E1` in sector 0), keeps it, and rewrites
+only the data sectors (verified live: a card formatted by a phone was re-written here).
 
 ### Key-recovery ("decode") — the native engine *is* crapto1
 The 5 functions in the native DLL `72f1b856-…​.fr` (i386, cdecl) implement Crypto-1
@@ -115,5 +117,8 @@ DESFire, Ultralight/NTAG family; auto-probes LF then HID). **Magic test** —
 distinguished a genuine Classic 1K from a **gen1a** card (1D backdoor, retried) and
 a **gen2/CUID** card (block-0 write-probe: flip a byte, read back, restore), all on
 real cards. **Blank T5577 programming** (2D → wrote an EM4100 ID, read it back).
-Implemented across `src/{furui,session,crack,nested,crypto1,dump}.c` and driven
-from `src/app.c` / `src/pmctl.c`.
+**NDEF Records** (Text/URI/social/review/Smart-Poster/vCard/AAR/geo/MIME/external/raw
+→ MAD + `03/FE` TLV) write+read on a magic card and update on an already-formatted
+genuine card (verified live). Implemented across
+`src/{furui,session,crack,nested,crypto1,dump,ndef}.c` and driven from `src/app.c` /
+`src/pmctl.c`.

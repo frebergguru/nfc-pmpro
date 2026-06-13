@@ -25,10 +25,10 @@ cmake -G Ninja -S . -B build && ninja -C build
 ctest --test-dir build --output-on-failure
 ```
 
-`ctest` runs the Crypto-1 cipher, key-recovery, and dump/protocol self-tests. **Keep
-it green** — any change to `src/crypto1.c`, `src/nested.c`, or `src/dump.c` should
-pass the existing tests, and new protocol/parsing logic should come with a test in
-`tests/`.
+`ctest` runs the Crypto-1 cipher, key-recovery, dump/protocol, and NDEF self-tests.
+**Keep it green** — any change to `src/crypto1.c`, `src/nested.c`, `src/dump.c`, or
+`src/ndef.c` should pass the existing tests, and new protocol/parsing logic should
+come with a test in `tests/`.
 
 A clean build is warning-free; please don't introduce new compiler warnings.
 
