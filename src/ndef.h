@@ -107,6 +107,7 @@ typedef struct {
     const char *email;
     const char *org;
     const char *url;
+    const char *address; /* free-form, stored in the ADR street component */
     const char *note;
 } ndef_vcard;
 int ndef_add_vcard(ndef_message *m, const ndef_vcard *vc);

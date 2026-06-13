@@ -81,7 +81,10 @@ blank, and whole-card tag operations:
   **verifies every write by reading the sector back** — it won't claim a change it
   can't prove. Plus Copy/Erase for LF EM4100. (Lock is deferred — it is irreversible.)
 - **Records (NDEF)** — build and write NDEF records onto a Mifare Classic card,
-  and read them back. Supports **Text**, **URL / URI** (with the well-known scheme
+  and read them back. **Read records** lists each record's full content and loads
+  the first one back into the builder (picks the matching type and fills the fields
+  — including vCard name/phone/email/org/url/address), so you can edit and rewrite
+  it. Supports **Text**, **URL / URI** (with the well-known scheme
   prefixes — so http(s), `tel:`, `mailto:`, video / file links are all
   covered), **Social media** (pick a platform — X, Instagram, LinkedIn, YouTube,
   TikTok, GitHub, WhatsApp, … — plus a handle, and it builds the profile URL),

@@ -75,7 +75,7 @@ typedef struct {
     GtkWidget *rec_text_lang, *rec_text_body;
     GtkWidget *rec_uri;
     GtkWidget *rec_sp_uri, *rec_sp_title;
-    GtkWidget *rec_vc_name, *rec_vc_phone, *rec_vc_email, *rec_vc_org, *rec_vc_url;
+    GtkWidget *rec_vc_name, *rec_vc_phone, *rec_vc_email, *rec_vc_org, *rec_vc_url, *rec_vc_addr;
     GtkWidget *rec_aar;
     GtkWidget *rec_geo;
     GtkWidget *rec_social_site, *rec_social_handle;
@@ -1117,6 +1117,11 @@ static gpointer w_ndef_write(gpointer p)
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
 
+/* carry one parsed record from the read worker to the main thread for loading
+ * into the builder fields (GTK widgets must be touched on the main thread) */
+typedef struct { App *a; ndef_record rec; } RecLoad;
+static gboolean rec_load_idle(gpointer p);   /* defined with the Records callbacks */
+
 static gpointer w_ndef_read(gpointer p)
 {
     App *a = p;
@@ -1145,6 +1150,14 @@ static gpointer w_ndef_read(gpointer p)
                     char d[NDEF_MAX_PAYLOAD + 128];
                     ndef_record_describe(&m.rec[i], d, sizeof d);
                     post(a, K_RECORDS, 1, "  [%d] %s", i, d);
+                }
+                if (m.n > 0) {              /* load record [0] into the builder fields */
+                    RecLoad *rl = g_new(RecLoad, 1);
+                    rl->a = a; rl->rec = m.rec[0];
+                    g_idle_add(rec_load_idle, rl);
+                    post(a, K_RECORDS, 1, m.n > 1
+                         ? "  ↳ loaded record [0] into the builder above (%d more not loaded) — edit and Write to update."
+                         : "  ↳ loaded into the builder above — edit and Write to card to update it.", m.n - 1);
                 }
                 post(a, K_TOAST, 1, "Read %d NDEF record(s)", m.n);
                 app_beep(a);
@@ -1484,6 +1497,7 @@ static int rec_append_current(App *a)
         ndef_vcard vc = {0};
         vc.name = TXT(rec_vc_name); vc.phone = TXT(rec_vc_phone);
         vc.email = TXT(rec_vc_email); vc.org = TXT(rec_vc_org); vc.url = TXT(rec_vc_url);
+        vc.address = TXT(rec_vc_addr);
         return ndef_add_vcard(&a->rec_msg, &vc);
     }
     if (!strcmp(pg, "mime")) { const char *d = TXT(rec_mime_data);
@@ -1500,6 +1514,157 @@ static int rec_append_current(App *a)
     }
 #undef TXT
     return -1;
+}
+
+/* ---- load a read record back into the builder fields -------------------- */
+
+static void rec_set_type(App *a, const char *page)
+{
+    for (guint i = 0; i < G_N_ELEMENTS(REC_PAGES); i++)
+        if (!strcmp(REC_PAGES[i], page)) {       /* triggers on_rectype_changed -> stack */
+            gtk_drop_down_set_selected(GTK_DROP_DOWN(a->rec_type), i);
+            return;
+        }
+}
+
+/* reverse of vc_escape: "\," -> "," , "\n" -> newline, etc. */
+static void vc_unescape(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (; in && *in && o + 1 < cap; in++) {
+        if (*in == '\\' && in[1]) { in++; out[o++] = (*in == 'n' || *in == 'N') ? '\n' : *in; }
+        else out[o++] = *in;
+    }
+    out[o] = 0;
+}
+
+/* the idx-th ';'-separated component of a structured value (keeps \; escapes). */
+static void vc_component(const char *val, int idx, char *out, size_t cap)
+{
+    int comp = 0; size_t o = 0; out[0] = 0;
+    for (const char *p = val; *p; p++) {
+        if (*p == '\\' && p[1]) {                 /* escaped pair — keep both */
+            if (comp == idx && o + 2 < cap) { out[o++] = *p; out[o++] = p[1]; }
+            p++; continue;
+        }
+        if (*p == ';') { if (comp == idx) break; comp++; continue; }
+        if (comp == idx && o + 1 < cap) out[o++] = *p;
+    }
+    out[o] = 0;
+}
+
+/* extract a vCard property value, e.g. prop "EMAIL" from "EMAIL;TYPE=HOME:a@b". */
+static void vcard_field(const char *vc, const char *prop, char *out, size_t cap)
+{
+    out[0] = 0;
+    size_t pn = strlen(prop);
+    for (const char *p = vc; p && *p; ) {
+        if (strncmp(p, prop, pn) == 0 && (p[pn] == ':' || p[pn] == ';')) {
+            const char *c = strchr(p, ':'), *nl = strchr(p, '\n');
+            if (c && (!nl || c < nl)) {
+                const char *v = c + 1; size_t i = 0;
+                while (v[i] && v[i] != '\r' && v[i] != '\n' && i + 1 < cap) { out[i] = v[i]; i++; }
+                out[i] = 0; return;
+            }
+        }
+        const char *nl = strchr(p, '\n');
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+/* Select the matching record type and fill the builder fields from `r`. */
+static void rec_load_record(App *a, const ndef_record *r)
+{
+#define SET(w, s) gtk_editable_set_text(GTK_EDITABLE(a->w), s)
+    if (r->tnf == NDEF_TNF_WELL_KNOWN && r->type_len == 1 && r->type[0] == 'U') {
+        char uri[NDEF_MAX_PAYLOAD];
+        if (ndef_uri_full(r, uri, sizeof uri) < 0) return;
+        for (int i = 0; NDEF_SOCIAL[i].name; i++) {            /* known social profile? */
+            size_t pl = strlen(NDEF_SOCIAL[i].prefix);
+            if (strncmp(uri, NDEF_SOCIAL[i].prefix, pl) == 0) {
+                rec_set_type(a, "social");
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(a->rec_social_site), (guint)i);
+                SET(rec_social_handle, uri + pl); return;
+            }
+        }
+        for (int i = 0; NDEF_SERVICE[i].name; i++) {           /* known service/review link? */
+            size_t pl = strlen(NDEF_SERVICE[i].prefix);
+            if (strncmp(uri, NDEF_SERVICE[i].prefix, pl) == 0) {
+                rec_set_type(a, "service");
+                gtk_drop_down_set_selected(GTK_DROP_DOWN(a->rec_service_site), (guint)i);
+                SET(rec_service_value, uri + pl); return;
+            }
+        }
+        if (strncmp(uri, "geo:", 4) == 0) { rec_set_type(a, "geo"); SET(rec_geo, uri + 4); return; }
+        rec_set_type(a, "uri"); SET(rec_uri, uri); return;
+    }
+    if (r->tnf == NDEF_TNF_WELL_KNOWN && r->type_len == 1 && r->type[0] == 'T'
+        && r->payload_len >= 1) {
+        size_t ll = r->payload[0] & 0x3f;
+        char lang[64] = "", body[NDEF_MAX_PAYLOAD] = "";
+        if (1 + ll <= r->payload_len) {
+            memcpy(lang, r->payload + 1, ll); lang[ll] = 0;
+            size_t bl = r->payload_len - 1 - ll;
+            memcpy(body, r->payload + 1 + ll, bl); body[bl] = 0;
+        }
+        rec_set_type(a, "text"); SET(rec_text_lang, lang); SET(rec_text_body, body); return;
+    }
+    if (r->tnf == NDEF_TNF_WELL_KNOWN && r->type_len == 2 && r->type[0] == 'S' && r->type[1] == 'p') {
+        ndef_message inner; char uri[NDEF_MAX_PAYLOAD] = "", title[256] = "";
+        if (ndef_decode(r->payload, r->payload_len, &inner) > 0)
+            for (int i = 0; i < inner.n; i++) {
+                if (ndef_uri_full(&inner.rec[i], uri, sizeof uri) >= 0) continue;
+                if (inner.rec[i].tnf == NDEF_TNF_WELL_KNOWN && inner.rec[i].type_len == 1
+                    && inner.rec[i].type[0] == 'T' && inner.rec[i].payload_len >= 1) {
+                    size_t ll = inner.rec[i].payload[0] & 0x3f, bl = inner.rec[i].payload_len - 1 - ll;
+                    if (1 + ll <= inner.rec[i].payload_len && bl < sizeof title) {
+                        memcpy(title, inner.rec[i].payload + 1 + ll, bl); title[bl] = 0;
+                    }
+                }
+            }
+        rec_set_type(a, "sp"); SET(rec_sp_uri, uri); SET(rec_sp_title, title); return;
+    }
+    char ty[NDEF_MAX_TYPE + 1]; memcpy(ty, r->type, r->type_len); ty[r->type_len] = 0;
+    char body[NDEF_MAX_PAYLOAD + 1];
+    size_t pn = r->payload_len < NDEF_MAX_PAYLOAD ? r->payload_len : NDEF_MAX_PAYLOAD;
+    memcpy(body, r->payload, pn); body[pn] = 0;
+    if (r->tnf == NDEF_TNF_MIME) {
+        if (strcmp(ty, "text/vcard") == 0 || strcmp(ty, "text/x-vcard") == 0) {
+            char v[256];
+            rec_set_type(a, "vcard");
+            vcard_field(body, "FN",    v, sizeof v); SET(rec_vc_name, v);
+            vcard_field(body, "TEL",   v, sizeof v); SET(rec_vc_phone, v);
+            vcard_field(body, "EMAIL", v, sizeof v); SET(rec_vc_email, v);
+            vcard_field(body, "ORG",   v, sizeof v); SET(rec_vc_org, v);
+            vcard_field(body, "URL",   v, sizeof v); SET(rec_vc_url, v);
+            char adr[512], comp[512], addr[512];
+            vcard_field(body, "ADR", adr, sizeof adr);   /* ";;street;;;;;" */
+            vc_component(adr, 2, comp, sizeof comp);      /* street component */
+            vc_unescape(comp, addr, sizeof addr);
+            SET(rec_vc_addr, addr);
+            return;
+        }
+        rec_set_type(a, "mime"); SET(rec_mime_type, ty); SET(rec_mime_data, body); return;
+    }
+    if (r->tnf == NDEF_TNF_EXTERNAL) {
+        if (strcmp(ty, "android.com:pkg") == 0) { rec_set_type(a, "aar"); SET(rec_aar, body); return; }
+        rec_set_type(a, "ext"); SET(rec_ext_type, ty); SET(rec_ext_data, body); return;
+    }
+    /* anything else -> the raw editor (TNF + type hex + payload hex) */
+    char tnf[8], thex[3 * NDEF_MAX_TYPE + 1], phex[3 * 256 + 1];
+    snprintf(tnf, sizeof tnf, "%u", r->tnf);
+    pmpro_hex(r->type, r->type_len, thex, sizeof thex);
+    pmpro_hex(r->payload, pn < 256 ? pn : 256, phex, sizeof phex);
+    rec_set_type(a, "raw"); SET(rec_raw_tnf, tnf); SET(rec_raw_type, thex); SET(rec_raw_payload, phex);
+#undef SET
+}
+
+static gboolean rec_load_idle(gpointer p)
+{
+    RecLoad *rl = p;
+    rec_load_record(rl->a, &rl->rec);
+    g_free(rl);
+    return G_SOURCE_REMOVE;
 }
 
 static void on_ndef_add(GtkButton *b, gpointer u)
@@ -2587,6 +2752,7 @@ static GtkWidget *page_records(App *a)
     gtk_box_append(GTK_BOX(g), field_row("Email", "ada@example.io", &a->rec_vc_email));
     gtk_box_append(GTK_BOX(g), field_row("Org", "Analytical Engines", &a->rec_vc_org));
     gtk_box_append(GTK_BOX(g), field_row("URL", "https://example.io", &a->rec_vc_url));
+    gtk_box_append(GTK_BOX(g), field_row("Address", "Street, City", &a->rec_vc_addr));
     gtk_stack_add_named(GTK_STACK(a->rec_stack), g, "vcard");
 
     g = rec_group();

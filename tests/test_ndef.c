@@ -69,11 +69,14 @@ static void test_smartposter(void)
 static void test_vcard_aar_external(void)
 {
     ndef_message m; ndef_msg_init(&m);
-    ndef_vcard vc = { .name = "Ada", .phone = "+1555", .email = "ada@x.io" };
+    ndef_vcard vc = { .name = "Ada", .phone = "+1555", .email = "ada@x.io",
+                      .address = "Main St 1, Town" };
     CHECK(ndef_add_vcard(&m, &vc) == 0, "vcard add");
     CHECK(m.rec[0].tnf == NDEF_TNF_MIME, "vcard tnf");
     CHECK(memcmp(m.rec[0].type, "text/vcard", 10) == 0, "vcard mime type");
     CHECK(memcmp(m.rec[0].payload, "BEGIN:VCARD", 11) == 0, "vcard body");
+    CHECK(strstr((char *)m.rec[0].payload, "ADR:;;Main St 1\\, Town;;;;;") != NULL,
+          "vcard ADR escaped");
 
     ndef_msg_init(&m);
     CHECK(ndef_add_aar(&m, "com.example.app") == 0, "aar add");

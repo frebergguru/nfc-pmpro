@@ -217,6 +217,18 @@ static void vc_add(char *buf, size_t cap, size_t *off, const char *fmt, const ch
     if (w > 0 && (size_t)w < cap - *off) *off += (size_t)w;
 }
 
+/* vCard 3.0 text escaping: backslash-escape ';' ',' '\' and newline. */
+static void vc_escape(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (; in && *in && o + 2 < cap; in++) {
+        if (*in == ';' || *in == ',' || *in == '\\') { out[o++] = '\\'; out[o++] = *in; }
+        else if (*in == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else out[o++] = *in;
+    }
+    out[o] = 0;
+}
+
 int ndef_add_vcard(ndef_message *m, const ndef_vcard *vc)
 {
     char buf[NDEF_MAX_PAYLOAD];
@@ -228,6 +240,12 @@ int ndef_add_vcard(ndef_message *m, const ndef_vcard *vc)
     vc_add(buf, sizeof buf, &off, "EMAIL:%s\r\n", vc->email);
     vc_add(buf, sizeof buf, &off, "ORG:%s\r\n", vc->org);
     vc_add(buf, sizeof buf, &off, "URL:%s\r\n", vc->url);
+    if (vc->address && *vc->address) {           /* ADR street component */
+        char esc[512];
+        vc_escape(vc->address, esc, sizeof esc);
+        int w = snprintf(buf + off, sizeof buf - off, "ADR:;;%s;;;;;\r\n", esc);
+        if (w > 0 && (size_t)w < sizeof buf - off) off += (size_t)w;
+    }
     vc_add(buf, sizeof buf, &off, "NOTE:%s\r\n", vc->note);
     int w = snprintf(buf + off, sizeof buf - off, "END:VCARD\r\n");
     if (w > 0 && (size_t)w < sizeof buf - off) off += (size_t)w;
@@ -352,11 +370,34 @@ void ndef_record_describe(const ndef_record *r, char *out, size_t cap)
         snprintf(tmp, sizeof tmp, "Text [%s]: %s", lang, body);
     } else if (r->tnf == NDEF_TNF_WELL_KNOWN && r->type_len == 2
                && r->type[0] == 'S' && r->type[1] == 'p') {
-        snprintf(tmp, sizeof tmp, "Smart Poster (%zu B nested message)", r->payload_len);
+        ndef_message inner;
+        char uri[NDEF_MAX_PAYLOAD] = "", title[256] = "";
+        if (ndef_decode(r->payload, r->payload_len, &inner) > 0)
+            for (int i = 0; i < inner.n; i++) {
+                if (ndef_uri_full(&inner.rec[i], uri, sizeof uri) >= 0) continue;
+                if (inner.rec[i].tnf == NDEF_TNF_WELL_KNOWN && inner.rec[i].type_len == 1
+                    && inner.rec[i].type[0] == 'T' && inner.rec[i].payload_len >= 1) {
+                    size_t ll = inner.rec[i].payload[0] & 0x3f, bl = inner.rec[i].payload_len - 1 - ll;
+                    if (1 + ll <= inner.rec[i].payload_len && bl < sizeof title) {
+                        memcpy(title, inner.rec[i].payload + 1 + ll, bl); title[bl] = 0;
+                    }
+                }
+            }
+        if (title[0]) snprintf(tmp, sizeof tmp, "Smart Poster: %s  (\"%s\")", uri, title);
+        else          snprintf(tmp, sizeof tmp, "Smart Poster: %s", uri);
     } else if (r->tnf == NDEF_TNF_MIME) {
         char ty[NDEF_MAX_TYPE + 1];
         memcpy(ty, r->type, r->type_len); ty[r->type_len] = 0;
-        snprintf(tmp, sizeof tmp, "MIME %s (%zu B)", ty, r->payload_len);
+        if (strncmp(ty, "text/", 5) == 0) {        /* text MIME (e.g. vCard) — show it */
+            char body[NDEF_MAX_PAYLOAD + 1];
+            size_t pn = r->payload_len < NDEF_MAX_PAYLOAD ? r->payload_len : NDEF_MAX_PAYLOAD;
+            memcpy(body, r->payload, pn); body[pn] = 0;
+            for (size_t i = 0; i < pn; i++)        /* flatten newlines for a one-liner */
+                if (body[i] == '\r' || body[i] == '\n') body[i] = ' ';
+            snprintf(tmp, sizeof tmp, "MIME %s: %s", ty, body);
+        } else {
+            snprintf(tmp, sizeof tmp, "MIME %s (%zu B)", ty, r->payload_len);
+        }
     } else if (r->tnf == NDEF_TNF_EXTERNAL) {
         char ty[NDEF_MAX_TYPE + 1], pl[NDEF_MAX_PAYLOAD + 1];
         memcpy(ty, r->type, r->type_len); ty[r->type_len] = 0;
