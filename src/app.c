@@ -37,6 +37,7 @@ typedef struct {
     GMutex lock;
 
     GtkWidget *status_pill;
+    GtkWidget *spinner;        /* header busy indicator (visible while an op runs) */
     GtkWidget *info_label;
     GtkWidget *mute_check;     /* the "Mute beeps" toggle (for restore) */
     GPtrArray *key_files;      /* paths of imported .keys files (persisted) */
@@ -430,13 +431,14 @@ static void read_hf_show(App *a, furui_hf_card *c)
     uint16_t atqa = c->tail_len >= 2 ? (c->tail[0] | (uint16_t)c->tail[1] << 8) : 0;
     int sak0 = -1;
     int open_sectors = 0;
+    int active = 0;          /* card selected? reads chain after one activate; re-select after a fail */
     for (int s = 0; s < 16; s++) {
         uint8_t blk[64], usekey[6];
         int usetype = -1;
-        furui_activate(&a->dev);
+        if (!active) furui_activate(&a->dev);
         size_t bl = furui_read_sector(&a->dev, (uint8_t)s, 1, a->cur_key, NULL, blk, sizeof blk);
         if (bl >= 64) { memcpy(usekey, a->cur_key, 6); usetype = 0; }
-        if (usetype < 0) {
+        if (usetype < 0) {                       /* a failed auth halts the card — re-select */
             uint8_t fk[6];
             if (furui_dict_attack(&a->dev, (uint8_t)(s * 4), 0, fk)) {
                 furui_activate(&a->dev);
@@ -449,6 +451,7 @@ static void read_hf_show(App *a, furui_hf_card *c)
                 if (bl >= 64) { memcpy(usekey, fk, 6); usetype = 1; }
             }
         }
+        active = (usetype >= 0);                 /* card stays selected only after a successful read */
         if (usetype >= 0) {
             open_sectors++;
             if (s == 0) sak0 = blk[5];
@@ -1232,6 +1235,47 @@ static gpointer w_crack(gpointer p)
     g_atomic_int_set(&a->busy, FALSE); g_mutex_unlock(&a->lock); g_free(j); return NULL;
 }
 
+/* show/hide the header busy indicator (main thread only) */
+static void busy_show(App *a)
+{
+    if (a->spinner) { gtk_spinner_start(GTK_SPINNER(a->spinner)); gtk_widget_set_visible(a->spinner, TRUE); }
+    if (a->status_pill) {
+        gtk_label_set_text(GTK_LABEL(a->status_pill), "Working…");
+        gtk_widget_remove_css_class(a->status_pill, "ok");
+        gtk_widget_remove_css_class(a->status_pill, "bad");
+        gtk_widget_add_css_class(a->status_pill, "busy");
+    }
+}
+
+static gboolean busy_done_idle(gpointer p)
+{
+    App *a = p;
+    if (a->spinner) { gtk_spinner_stop(GTK_SPINNER(a->spinner)); gtk_widget_set_visible(a->spinner, FALSE); }
+    if (a->status_pill) {
+        gtk_widget_remove_css_class(a->status_pill, "busy");
+        /* if no worker set a final status, restore the ready state */
+        if (g_strcmp0(gtk_label_get_text(GTK_LABEL(a->status_pill)), "Working…") == 0) {
+            char s[160];
+            if (a->connected) snprintf(s, sizeof s, "Connected — %s", a->dev.path);
+            else snprintf(s, sizeof s, "Not connected");
+            gtk_label_set_text(GTK_LABEL(a->status_pill), s);
+            gtk_widget_add_css_class(a->status_pill, a->connected ? "ok" : "bad");
+        }
+    }
+    return G_SOURCE_REMOVE;
+}
+
+/* runs the worker, then signals the main thread to drop the busy indicator */
+typedef struct { App *a; GThreadFunc fn; gpointer arg; } OpCtx;
+static gpointer op_trampoline(gpointer p)
+{
+    OpCtx *c = p;
+    c->fn(c->arg);
+    g_idle_add(busy_done_idle, c->a);
+    g_free(c);
+    return NULL;
+}
+
 static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
 {
     if (!g_atomic_int_compare_and_exchange(&a->busy, FALSE, TRUE)) {
@@ -1239,7 +1283,10 @@ static gboolean start_op(App *a, GThreadFunc fn, gpointer arg)
         if (arg) g_free(arg);
         return FALSE;
     }
-    g_thread_unref(g_thread_new("pmpro-op", fn, arg ? arg : a));
+    busy_show(a);
+    OpCtx *c = g_new(OpCtx, 1);
+    c->a = a; c->fn = fn; c->arg = arg ? arg : a;
+    g_thread_unref(g_thread_new("pmpro-op", op_trampoline, c));
     return TRUE;
 }
 
@@ -2819,7 +2866,8 @@ static void load_css(void)
     gtk_css_provider_load_from_string(p,
         ".pill{padding:2px 12px;border-radius:12px;font-weight:bold;}"
         ".pill.ok{background:alpha(@success_color,.2);color:@success_color;}"
-        ".pill.bad{background:alpha(@error_color,.2);color:@error_color;}");
+        ".pill.bad{background:alpha(@error_color,.2);color:@error_color;}"
+        ".pill.busy{background:alpha(@accent_bg_color,.25);color:@accent_fg_color;}");
     gtk_style_context_add_provider_for_display(gdk_display_get_default(),
         GTK_STYLE_PROVIDER(p), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(p);
@@ -2859,6 +2907,10 @@ static void activate(GtkApplication *gapp, gpointer user)
     gtk_widget_add_css_class(a->status_pill, "pill");
     gtk_widget_add_css_class(a->status_pill, "bad");
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), a->status_pill);
+    a->spinner = gtk_spinner_new();
+    gtk_widget_set_visible(a->spinner, FALSE);
+    gtk_widget_set_tooltip_text(a->spinner, "Working…");
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), a->spinner);
 
     GtkWidget *stack = adw_view_stack_new();
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_device(a),

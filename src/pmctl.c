@@ -191,17 +191,20 @@ int main(int argc, char **argv)
         printf("magic test: %s — %s\n", label, d);
     } else if (!strcmp(cmd, "dumphf")) {
         if (!furui_connect(&dev)) { printf("connect failed\n"); return 3; }
+        uint8_t key[6];
+        if (argc > 2 && pmpro_parse_hex(argv[2], key, 6) == 6) ; else memset(key, 0xFF, 6);
+        char kh[20]; pmpro_hex(key, 6, kh, sizeof kh);
         uint8_t resp[FURUI_MAXMSG];
-        uint8_t a10[1] = {0x10};                       /* activate card */
+        uint8_t a10[1] = {0x10};                       /* activate card ONCE */
         size_t r = furui_exec(&dev, a10, 1, resp, sizeof resp, 2000);
         printf("activate ack=%d\n", r >= 3 && resp[2] == 1);
-        for (int sec = 0; sec < 16; sec++) {
+        for (int sec = 0; sec < 16; sec++) {           /* no re-activate per sector */
             uint8_t p[15] = {0x17, (uint8_t)sec, 0x01,
-                             0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, 0,0,0,0,0,0};
+                             key[0],key[1],key[2],key[3],key[4],key[5], 0,0,0,0,0,0};
             r = furui_exec(&dev, p, sizeof p, resp, sizeof resp, 3000);
-            int ok = r >= 3 && resp[2] == 1;
-            printf("sector %2d (keyA=FFFFFFFFFFFF) ack=%d", sec, ok);
-            if (r) { printf("  resp[%zu]:", r); for (size_t i = 0; i < r && i < 64; i++) printf(" %02x", resp[i]); }
+            int auth = r >= 4 && resp[3] == 0x0f;      /* 0f = auth OK (resp[2] is just cmd-ack) */
+            printf("sector %2d (keyA=%s) auth=%d", sec, kh, auth);
+            if (auth) { printf("  data:"); for (size_t i = 5; i < r && i < 5 + 16; i++) printf(" %02x", resp[i]); }
             printf("\n");
         }
     } else if (!strcmp(cmd, "readkey")) {
@@ -211,11 +214,12 @@ int main(int argc, char **argv)
         else memset(key, 0xFF, 6);
         char kh[20]; pmpro_hex(key, 6, kh, sizeof kh);
         printf("reading 16 sectors with key A = %s\n", kh);
-        int open = 0;
+        int open = 0, active = 0;
         for (int s = 0; s < 16; s++) {
-            furui_activate(&dev);
+            if (!active) furui_activate(&dev);        /* one select; reads chain */
             uint8_t blk[64];
             size_t bl = furui_read_sector(&dev, (uint8_t)s, 1, key, NULL, blk, sizeof blk);
+            active = (bl >= 64);                      /* re-select only after a failed read */
             int nz = 0; for (size_t i = 0; i < bl; i++) if (blk[i]) { nz = 1; break; }
             if (bl && nz) { open++; printf("  sector %2d:", s); for (size_t i=0;i<bl&&i<48;i++) printf(" %02x", blk[i]); printf("\n"); }
         }
