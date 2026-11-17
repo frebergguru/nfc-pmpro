@@ -177,10 +177,12 @@ says you *may* need it), enable your terminal (or the `pmctl` binary) under
 sandboxed process `IOHIDManagerOpen` returns
 `0xe00002e2` (`kIOReturnNotPermitted`); that is the sandbox, not TCC.
 
-**GUI on macOS (optional, unverified):** needs `brew install pkg-config gtk4
-libadwaita`, then configure with `-DPMPRO_GUI=ON` (the default). It has not been
-built or run on macOS yet; the CLI is the intended path. The GUI never reopens
-the device, so after an unplug it keeps failing until restarted (same as on Linux).
+**GUI on macOS:** verified on macOS 26 / Apple Silicon: the GTK GUI builds and
+runs (build tree and packaged app), connects to the reader and reads cards, and
+reopens the device after an unplug. Prerequisites and the `-DPMPRO_GUI=ON` build
+are in [docs/macos.md](docs/macos.md).
+
+**As an app:** `ninja -C build-gui macos-dmg` builds a drag-to-install DMG — see [docs/macos.md](docs/macos.md#install-as-an-app).
 
 ## Device access (one-time)
 The HID node is root-only by default. Install the udev rule:

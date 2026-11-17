@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(pmpro C)
+project(pmpro VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -109,17 +109,37 @@ add_executable(pmpro
     src/nested.c
     src/dump.c
     src/ndef.c
+    src/macbundle.c
     ${ICON_GRESOURCE})
 
 target_include_directories(pmpro PRIVATE ${ADW_INCLUDE_DIRS} src)
 target_link_directories(pmpro PRIVATE ${ADW_LIBRARY_DIRS})
 target_link_libraries(pmpro PRIVATE ${ADW_LIBRARIES} hardnested ${PMPRO_HID_LIBS})
 target_compile_options(pmpro PRIVATE ${ADW_CFLAGS_OTHER})
+if(APPLE)
+    # Leave room for install_name_tool when the .app bundle relocates dylibs.
+    target_link_options(pmpro PRIVATE -Wl,-headerpad_max_install_names)
+
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(MAKE_APP ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/macos/make_app.py
+        --build ${CMAKE_BINARY_DIR} --version ${PROJECT_VERSION})
+    if(PMPRO_BREW_PREFIX)   # optional; default is `brew --prefix`
+        list(APPEND MAKE_APP --prefix ${PMPRO_BREW_PREFIX})
+    endif()
+    add_custom_target(macos-app COMMAND ${MAKE_APP} DEPENDS pmpro pmctl
+        COMMENT "Packaging NFC PM-Pro.app" VERBATIM)
+    add_custom_target(macos-dmg COMMAND ${MAKE_APP} --dmg DEPENDS pmpro pmctl
+        COMMENT "Packaging NFC PM-Pro.app + DMG" VERBATIM)
+    add_test(NAME make_app_py COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_SOURCE_DIR}/tools/macos/test_make_app.py)
+endif()
 endif()
 
 # CLI tools (no GTK) — protocol control + RE probe
 add_executable(pmctl src/pmctl.c ${PMPRO_HIDRAW} src/furui.c src/session.c src/protocol.c src/crypto1.c src/crack.c src/hardnested_glue.c src/nested.c src/dump.c src/ndef.c)
 target_link_libraries(pmctl PRIVATE hardnested ${PMPRO_HID_LIBS})
+if(APPLE)
+    target_link_options(pmctl PRIVATE -Wl,-headerpad_max_install_names)
+endif()
 add_executable(pmprobe src/probe.c ${PMPRO_HIDRAW} src/protocol.c)
 target_link_libraries(pmprobe PRIVATE ${PMPRO_HID_LIBS})
 target_include_directories(pmprobe PRIVATE src)
@@ -131,6 +151,8 @@ add_executable(test_dump     tests/test_dump.c     src/dump.c src/protocol.c)
 add_executable(test_ndef     tests/test_ndef.c     src/ndef.c)
 add_executable(test_hidraw_common tests/test_hidraw_common.c src/hidraw_common.c)
 target_include_directories(test_hidraw_common PRIVATE src)
+add_executable(test_macbundle tests/test_macbundle.c src/macbundle.c)
+target_include_directories(test_macbundle PRIVATE src)
 target_include_directories(test_cipher   PRIVATE src)
 target_include_directories(test_recovery PRIVATE src)
 target_include_directories(test_dump     PRIVATE src)
@@ -141,6 +163,7 @@ add_test(NAME recovery COMMAND test_recovery)
 add_test(NAME dump     COMMAND test_dump)
 add_test(NAME ndef     COMMAND test_ndef)
 add_test(NAME hidraw_common COMMAND test_hidraw_common)
+add_test(NAME macbundle COMMAND test_macbundle)
 
 install(TARGETS pmctl RUNTIME DESTINATION bin)
 if(PMPRO_GUI)

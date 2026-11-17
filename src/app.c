@@ -22,6 +22,7 @@
 #include "protocol.h"
 #include "dump.h"
 #include "ndef.h"
+#include "macbundle.h"
 
 #define APP_ID "com.furui.pmpro"
 
@@ -2937,7 +2938,7 @@ static void activate(GtkApplication *gapp, gpointer user)
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_dump(a),
         "dump", "Dump", "document-save-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_records(a),
-        "records", "Records", "emblem-documents-symbolic");
+        "records", "Records", "x-office-document-symbolic");
     adw_view_stack_add_titled_with_icon(ADW_VIEW_STACK(stack), page_console(a),
         "console", "Console", "utilities-terminal-symbolic");
 
@@ -2957,8 +2958,50 @@ static void activate(GtkApplication *gapp, gpointer user)
     gtk_window_present(GTK_WINDOW(win));
 }
 
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+/* When running from NFC PM-Pro.app, point GLib/GTK at the bundled runtime data. */
+static void setup_bundle_env(void)
+{
+    char raw[PATH_MAX], exe[PATH_MAX], contents[PATH_MAX], p[PATH_MAX];
+    uint32_t sz = sizeof raw;
+    if (_NSGetExecutablePath(raw, &sz) != 0 || !realpath(raw, exe)) return;
+    if (!pmpro_bundle_contents(exe, contents, sizeof contents)) return;
+    snprintf(p, sizeof p, "%s/Resources/share/glib-2.0/schemas", contents);
+    setenv("GSETTINGS_SCHEMA_DIR", p, 1);
+    snprintf(p, sizeof p, "%s/Resources/share", contents);
+    setenv("XDG_DATA_DIRS", p, 1);
+    /* gdk-pixbuf needs absolute loader paths: expand the token for THIS location
+     * (the app may have been moved or translocated) into a temp copy, every launch. */
+    snprintf(p, sizeof p, "%s/Resources/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache", contents);
+    /* Fallback if the expansion fails: still point at the bundled (unexpanded)
+     * cache so gdk-pixbuf never uses Homebrew's compiled-in one (two GLib copies). */
+    setenv("GDK_PIXBUF_MODULE_FILE", p, 1);
+    gchar *tmpl = NULL;
+    if (g_file_get_contents(p, &tmpl, NULL, NULL)) {
+        char *exp = pmpro_expand_bundle_token(tmpl, contents);
+        gchar *dst = g_build_filename(g_get_tmp_dir(), "pmpro-loaders.cache", NULL);
+        if (exp && g_file_set_contents(dst, exp, -1, NULL))
+            setenv("GDK_PIXBUF_MODULE_FILE", dst, 1);
+        free(exp); g_free(dst); g_free(tmpl);
+    }
+    /* Never consult module paths compiled into libgio/libgtk (/opt/homebrew). */
+    snprintf(p, sizeof p, "%s/Frameworks/gio/modules", contents);
+    setenv("GIO_MODULE_DIR", p, 1);
+    snprintf(p, sizeof p, "%s/Frameworks/gtk-4.0", contents);
+    setenv("GTK_PATH", p, 1);
+    setenv("GTK_EXE_PREFIX", contents, 1);
+}
+#endif
+
 int main(int argc, char **argv)
 {
+#ifdef __APPLE__
+    setup_bundle_env();
+#endif
     App a;
     memset(&a, 0, sizeof a);
     a.dev.fd = -1;

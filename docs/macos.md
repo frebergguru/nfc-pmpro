@@ -14,6 +14,29 @@ ninja -C build pmctl pmprobe
 The CLI needs no pkg-config: liblzma is found through CMake's `FindLibLZMA`.
 The GUI (`-DPMPRO_GUI=ON`) additionally needs `pkg-config gtk4 libadwaita`.
 
+## Install as an app
+
+Build a self-contained, drag-to-install app (Apple Silicon):
+
+    brew install cmake ninja pkg-config gtk4 libadwaita librsvg adwaita-icon-theme   # build machine only
+    cmake -G Ninja -S . -B build-gui -DPMPRO_GUI=ON
+    ninja -C build-gui macos-dmg      # → build-gui/pmpro-<version>-arm64.dmg
+
+Open the DMG and drag **NFC PM-Pro** to Applications. The app bundles its own
+GTK4/libadwaita, so the target Mac needs no Homebrew (verified on the build Mac:
+the bundle loads no Homebrew libraries). The app also bundles the Adwaita
+symbolic icons its tabs and buttons use. `pmctl` is included at
+`"/Applications/NFC PM-Pro.app/Contents/MacOS/pmctl"`.
+
+The app is ad-hoc signed, not notarized: on another Mac the first launch needs
+right-click → **Open** (or `xattr -dr com.apple.quarantine "/Applications/NFC PM-Pro.app"`).
+arm64 only. The minimum macOS is that of the bundled Homebrew libraries — see
+`LSMinimumSystemVersion` in the app's Info.plist (26.0 when built on macOS 26).
+
+Because the app is ad-hoc signed, if Connect fails with an access error, enable
+NFC PM-Pro under System Settings → Privacy & Security → Input Monitoring, and
+re-grant it after installing a rebuilt app (ad-hoc grants are tied to the build).
+
 ## Architecture
 
 - `pmpro_open` creates an `IOHIDManager`, matches the device, opens it, and
@@ -91,6 +114,9 @@ defined). It works, but hardnested is slower there than on x86 with AVX.
   command within ~0.1 s and the next command after replug works.
 - Multi-report replies: a MIFARE Classic 1K reads all 16 full 64-byte sectors
   (`readkey`, `dumphf`) — reports arrive in order with intact boundaries.
-- Not yet verified: the GTK GUI on macOS (needs `brew install pkg-config gtk4
-  libadwaita`; not built). The GUI never reopens the device, so after an unplug
-  it keeps failing until restarted (same as on Linux).
+- Verified on macOS 26 / Apple Silicon: the GTK GUI builds and runs (build tree
+  and packaged app), connects to the reader and reads cards, and reopens the
+  device after an unplug. Prerequisites: `brew install pkg-config gtk4 libadwaita
+  librsvg adwaita-icon-theme`.
+- Verified: `NFC PM-Pro.app` installed from the DMG into /Applications and launched
+  from Launchpad works — tab icons render, it connects and reads cards.
