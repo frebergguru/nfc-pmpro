@@ -331,8 +331,20 @@ static void post_sector(App *a, int kind, int sector, const uint8_t *d, int n)
 
 /* ---- device helpers (run on worker thread, hold a->lock) --------------- */
 
+/* Unplugged since the last op? Drop the stale handle so the next ensure_ready
+ * reopens. Caller holds a->lock. */
+static void drop_if_gone(App *a)
+{
+    if (a->opened && pmpro_is_gone(&a->dev)) {
+        pmpro_close(&a->dev);
+        a->opened = a->connected = FALSE;
+        post(a, K_STATUS, 0, "Device disconnected");
+    }
+}
+
 static gboolean ensure_ready(App *a)
 {
+    drop_if_gone(a);
     if (!a->opened) {
         if (!pmpro_open(&a->dev, NULL)) {
             post(a, K_STATUS, 0, "No device");
@@ -498,6 +510,7 @@ static gpointer w_autoread(gpointer p)
 {
     App *a = p;
     g_mutex_lock(&a->lock);
+    drop_if_gone(a);
     if (a->connected) {
         furui_hf_card c;
         if (furui_read_hf(&a->dev, &c)) {
@@ -2953,7 +2966,14 @@ int main(int argc, char **argv)
     a.app = adw_application_new(APP_ID, G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(a.app, "activate", G_CALLBACK(activate), &a);
     int status = g_application_run(G_APPLICATION(a.app), argc, argv);
-    pmpro_close(&a.dev);
+    /* A detached worker may hold a.lock for a long op (hardnested: minutes).
+     * Don't block quitting on it: if it still owns the device, skip the close;
+     * process exit releases it. Freeing the backend under it would be a
+     * use-after-free. */
+    if (g_mutex_trylock(&a.lock)) {
+        pmpro_close(&a.dev);
+        g_mutex_unlock(&a.lock);
+    }
     g_object_unref(a.app);
     return status;
 }

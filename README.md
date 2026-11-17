@@ -150,6 +150,38 @@ Install it as a desktop app (adds a launcher + icon):
 cmake -G Ninja -S . -B build -DCMAKE_INSTALL_PREFIX=/usr && sudo ninja -C build install
 ```
 
+### macOS (CLI)
+
+The device transport is ported to IOKit `IOHIDManager`, so the CLI tools build
+natively on macOS — no Linux, no libusb. The GTK GUI is optional (see below).
+
+```sh
+brew install cmake ninja xz
+cmake -G Ninja -S . -B build -DPMPRO_GUI=OFF
+ninja -C build pmctl pmprobe
+./build/pmctl connect     # connect + beep
+./build/pmctl identify    # auto-detect the tag on the reader
+```
+
+**Status:** the CLI builds and the offline tests pass on macOS. Hardware-tested
+on macOS 26 / Apple Silicon: `pmctl connect` works (handshake ~0.5 s),
+`identify`, `readid` and `readic` work, an EM4100 LF card reads correctly, and
+no-tag timeouts behave (no hang). Unplugging mid-command makes the command fail
+within ~0.1 s (no hang); after replug the next command works. A MIFARE Classic 1K
+reads all 16 sectors (64-byte sectors, multi-report replies) with `readkey`/`dumphf`. See [docs/macos.md](docs/macos.md).
+
+**Permission:** no Input Monitoring grant was needed for this vendor-page device
+when run from Terminal. If a command prints "grant Input Monitoring…" (the message
+says you *may* need it), enable your terminal (or the `pmctl` binary) under
+**System Settings → Privacy & Security → Input Monitoring** and retry. Inside a
+sandboxed process `IOHIDManagerOpen` returns
+`0xe00002e2` (`kIOReturnNotPermitted`); that is the sandbox, not TCC.
+
+**GUI on macOS (optional, unverified):** needs `brew install pkg-config gtk4
+libadwaita`, then configure with `-DPMPRO_GUI=ON` (the default). It has not been
+built or run on macOS yet; the CLI is the intended path. The GUI never reopens
+the device, so after an unplug it keeps failing until restarted (same as on Linux).
+
 ## Device access (one-time)
 The HID node is root-only by default. Install the udev rule:
 ```sh
