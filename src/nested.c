@@ -34,9 +34,9 @@ static int oddpar(uint8_t b) { return __builtin_parity(b) ^ 1; }
 /* mfoc's parity filter. */
 static int valid_nonce(uint32_t Nt, uint32_t NtEnc, uint32_t Ks1, const uint8_t *par)
 {
-    return ((oddpar((Nt >> 24) & 0xFF) == (int)((par[0]) ^ oddpar((NtEnc >> 24) & 0xFF) ^ BIT(Ks1, 16))) &
-            (oddpar((Nt >> 16) & 0xFF) == (int)((par[1]) ^ oddpar((NtEnc >> 16) & 0xFF) ^ BIT(Ks1, 8))) &
-            (oddpar((Nt >> 8)  & 0xFF) == (int)((par[2]) ^ oddpar((NtEnc >> 8)  & 0xFF) ^ BIT(Ks1, 0)))) ? 1 : 0;
+    return ((int)(oddpar((Nt >> 24) & 0xFF) == (int)((par[0]) ^ oddpar((NtEnc >> 24) & 0xFF) ^ BIT(Ks1, 16))) &
+            (int)(oddpar((Nt >> 16) & 0xFF) == (int)((par[1]) ^ oddpar((NtEnc >> 16) & 0xFF) ^ BIT(Ks1, 8))) &
+            (int)(oddpar((Nt >> 8)  & 0xFF) == (int)((par[2]) ^ oddpar((NtEnc >> 8)  & 0xFF) ^ BIT(Ks1, 0)))) ? 1 : 0;
 }
 
 static uint32_t le32(const uint8_t *p)

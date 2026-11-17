@@ -45,27 +45,50 @@ int main(void)
         "10 11 12 13 14 15 16 17 18 19 1a 1b 1c 1d 1e 1f "
         "20 21 22 23 24 25 26 27 28 29 2a 2b 2c 2d 2e 2f "
         "a0 a1 a2 a3 a4 a5 ff 07 80 69 b0 b1 b2 b3 b4 b5");
+    /* scratch files live in $TMPDIR (fallback /tmp) */
+    const char *td = getenv("TMPDIR");
+    if (!td || !*td) td = "/tmp";
+    char p_pmdump[512], p_mfd[512], p_mfd2[512], p_keys[512];
+    snprintf(p_pmdump, sizeof p_pmdump, "%s/_pmpro_test.pmdump", td);
+    snprintf(p_mfd,    sizeof p_mfd,    "%s/_pmpro_test.mfd", td);
+    snprintf(p_mfd2,   sizeof p_mfd2,   "%s/_pmpro_test2.mfd", td);
+    snprintf(p_keys,   sizeof p_keys,   "%s/_pmpro_test.keys", td);
+
     char err[128];
-    CHECK(pmpro_dump_save(&d, "/tmp/_pmpro_test.pmdump", err, sizeof err), "save .pmdump");
+    CHECK(pmpro_dump_save(&d, p_pmdump, err, sizeof err), "save .pmdump");
     pmpro_dump d2;
-    CHECK(pmpro_dump_load(&d2, "/tmp/_pmpro_test.pmdump", err, sizeof err) &&
+    CHECK(pmpro_dump_load(&d2, p_pmdump, err, sizeof err) &&
           d2.n_blocks == 1 && strcmp(d2.blocks[0], d.blocks[0]) == 0,
           "load .pmdump round-trips the sector");
 
     /* ---- .mfd (raw) round-trip ---- */
     unsigned char raw[1024];
     for (int i = 0; i < 1024; i++) raw[i] = (unsigned char)i;
-    FILE *f = fopen("/tmp/_pmpro_test.mfd", "wb"); fwrite(raw, 1, 1024, f); fclose(f);
-    pmpro_dump dm;
-    CHECK(pmpro_dump_load(&dm, "/tmp/_pmpro_test.mfd", err, sizeof err) && dm.n_blocks == 16,
-          "load 1K .mfd -> 16 sectors");
-    CHECK(pmpro_dump_save_mfd(&dm, "/tmp/_pmpro_test2.mfd", err, sizeof err), "export .mfd");
-    FILE *g = fopen("/tmp/_pmpro_test2.mfd", "rb");
-    unsigned char back[1024]; size_t rd = fread(back, 1, sizeof back, g); fclose(g);
-    CHECK(rd == 1024 && memcmp(raw, back, 1024) == 0, ".mfd export is byte-identical");
+    FILE *f = fopen(p_mfd, "wb");
+    if (!f) {
+        printf("FAIL - cannot create %s\n", p_mfd);
+        fails++;
+    } else {
+        fwrite(raw, 1, 1024, f);
+        fclose(f);
+        pmpro_dump dm;
+        CHECK(pmpro_dump_load(&dm, p_mfd, err, sizeof err) && dm.n_blocks == 16,
+              "load 1K .mfd -> 16 sectors");
+        CHECK(pmpro_dump_save_mfd(&dm, p_mfd2, err, sizeof err), "export .mfd");
+        FILE *g = fopen(p_mfd2, "rb");
+        if (!g) {
+            printf("FAIL - cannot open %s\n", p_mfd2);
+            fails++;
+        } else {
+            unsigned char back[1024];
+            size_t rd = fread(back, 1, sizeof back, g);
+            fclose(g);
+            CHECK(rd == 1024 && memcmp(raw, back, 1024) == 0, ".mfd export is byte-identical");
+        }
+    }
 
     /* ---- .keys export (keyA a0a1a2a3a4a5 + keyB b0b1b2b3b4b5) ---- */
-    int nk = pmpro_dump_save_keys(&d, "/tmp/_pmpro_test.keys", err, sizeof err);
+    int nk = pmpro_dump_save_keys(&d, p_keys, err, sizeof err);
     CHECK(nk == 2, ".keys export wrote 2 unique keys (keyA + keyB)");
 
     printf("\n%s\n", fails ? "*** DUMP TESTS FAILED ***" : "*** DUMP TESTS PASS ***");

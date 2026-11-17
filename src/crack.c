@@ -15,7 +15,7 @@ int furui_check_keys(pmpro_dev *dev, uint8_t block, uint8_t type,
 {
     /* cmd 13 = [13][block][type][count][key0..key{count-1}]. Chunk to keep the
      * packet within the device pack size. Response payload = the working key. */
-    const int CHUNK = 80;
+    enum { CHUNK = 80 };
     for (int off = 0; off < n; off += CHUNK) {
         int cnt = n - off < CHUNK ? n - off : CHUNK;
         uint8_t p[4 + CHUNK * 6], resp[FURUI_MAXMSG];

@@ -1,8 +1,10 @@
 # Build output
 /build/
+/build-*/
 *.o
 *.so
 *.a
+__pycache__/
 
 # Card dumps (may contain real credentials)
 *.mfd

@@ -67,6 +67,7 @@ bool pmpro_open(pmpro_dev *d, const char *path)
     d->fd = -1;
     d->err[0] = '\0';
     d->path[0] = '\0';
+    d->backend = NULL;
 
     if (path) {
         snprintf(d->path, sizeof d->path, "%s", path);
@@ -104,10 +105,8 @@ bool pmpro_write(pmpro_dev *d, const unsigned char *data, size_t len)
     }
     /* leading report-id byte (0x00, unnumbered) + 64 data bytes */
     unsigned char buf[1 + PMPRO_REPORT_LEN];
-    memset(buf, 0, sizeof buf);
-    if (len > PMPRO_REPORT_LEN)
-        len = PMPRO_REPORT_LEN;
-    memcpy(buf + 1, data, len);
+    buf[0] = 0x00;                                  /* unnumbered report id */
+    pmpro_fill_report(buf + 1, data, len);          /* 64 payload bytes */
 
     ssize_t w = write(d->fd, buf, sizeof buf);
     if (w < 0) {
@@ -134,4 +133,9 @@ int pmpro_read(pmpro_dev *d, unsigned char *buf, int timeout_ms)
     if (r < 0)
         return errno == EAGAIN ? 0 : -1;
     return (int)r;
+}
+
+bool pmpro_is_gone(const pmpro_dev *d)
+{
+    return d->fd < 0 || access(d->path, F_OK) != 0;
 }
